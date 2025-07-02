@@ -4,7 +4,6 @@ namespace ManualImageMapper;
 
 public static partial class FFI
 {
-    #region Enums
 
     public enum MachineType : ushort
     {
@@ -49,5 +48,9 @@ public static partial class FFI
         IMAGE_SCN_MEM_WRITE = 0x80000000
     }
 
-    #endregion
-} 
+    public enum PROCESSINFOCLASS
+    {
+        ProcessBasicInformation = 0
+    }
+
+}

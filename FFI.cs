@@ -50,6 +50,10 @@ public static partial class FFI
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool VirtualProtectEx(nint hProcess, nint lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
+    [LibraryImport("ntdll.dll")]
+    public static partial int NtQueryInformationProcess(nint ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, out PROCESS_BASIC_INFORMATION ProcessInformation, int ProcessInformationLength, out int ReturnLength);
+
+
     #endregion
 
 
@@ -60,13 +64,12 @@ public static partial class FFI
     // ---------------------------------------------------------------------
 
     /// <summary>
-    /// Opens the target process with minimal required permissions and returns the handle.
-    /// Throws on failure.
+    /// Opens the target process with PROCESS_ALL_ACCESS and returns the handle.
+    /// Throws on failure.N
     /// </summary>
     public static nint OpenTargetProcess(int pid)
     {
-        const uint PROCESS_REQUIRED = PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD;
-        var handle = OpenProcess(PROCESS_REQUIRED, false, pid);
+        var handle = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
         if (handle == nint.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), $"OpenProcess failed for PID {pid}");
         return handle;

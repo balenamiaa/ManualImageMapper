@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Linq;
 
 namespace ManualImageMapper;
 
@@ -46,8 +45,11 @@ public static class ManualMapper
             FFI.FlushInstructionCache(hProcess, remoteBase, nt.OptionalHeader.SizeOfImage);
             EraseHeaders(hProcess, remoteBase, nt.OptionalHeader.SizeOfHeaders);
 
-            // 9. Execute entrypoint via thread hijacking
-            HijackFirstThread(pid, remoteBase + (int)nt.OptionalHeader.AddressOfEntryPoint);
+            // 9. Execute entrypoint via thread hijacking (restores original RIP with tiny stub)
+            HijackFirstThread(pid, hProcess, remoteBase, nt);
+
+            // 10. Unlink from PEB lists for stealth
+            UnlinkFromPEB(hProcess, remoteBase);
         }
         finally
         {
@@ -118,10 +120,7 @@ public static class ManualMapper
                 var strAddr = FFI.AllocateMemory(hProcess, (uint)bytes.Length, FFI.PAGE_READWRITE);
                 FFI.WriteMemory(hProcess, strAddr, bytes);
 
-                // Obfuscated strings to avoid static detection
-                var kernel32 = DeobfuscateString("lfqofm6?.fmm"); // "kernel32.dll"
-                var loadLibA = DeobfuscateString("MbefMjcsfsz@"); // "LoadLibraryA"
-                var loadLib = FFI.GetProcAddress(FFI.GetModuleHandle(kernel32), loadLibA);
+                var loadLib = FFI.GetProcAddress(FFI.GetModuleHandle("kernel32.dll"), "LoadLibraryA");
                 FFI.CreateRemoteThreadAndWait(hProcess, loadLib, strAddr);
                 FFI.FreeMemory(hProcess, strAddr);
             }
@@ -171,15 +170,13 @@ public static class ManualMapper
         var zeros = new byte[headerSize];
         FFI.ProtectMemory(hProcess, remoteBase, headerSize, FFI.PAGE_READWRITE);
         FFI.WriteMemory(hProcess, remoteBase, zeros);
-        // Mark headers as no-access for stealth
-        FFI.ProtectMemory(hProcess, remoteBase, headerSize, FFI.PAGE_NOACCESS);
     }
 
     // ------------------------------------------------------------------
     // Thread hijack (simple – picks first thread of target)
     // ------------------------------------------------------------------
 
-    private static void HijackFirstThread(int pid, nint newRip)
+    private static void HijackFirstThread(int pid, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt)
     {
         var snap = FFI.CreateToolhelp32Snapshot(FFI.TH32CS_SNAPTHREAD, 0);
         if (snap == nint.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -202,7 +199,9 @@ public static class ManualMapper
                     FFI.SuspendThread(hThread);
                     var ctx = new FFI.CONTEXT64 { ContextFlags = FFI.CONTEXT_FULL };
                     FFI.GetThreadContext(hThread, ref ctx);
-                    ctx.Rip = (ulong)newRip;
+
+                    nint stubAddr = BuildAndWriteLoaderStub(hProcess, moduleBase, nt, (nint)ctx.Rip);
+                    ctx.Rip = (ulong)stubAddr;
                     FFI.SetThreadContext(hThread, ref ctx);
                     FFI.ResumeThread(hThread);
                     break; // hijacked one thread, good enough
@@ -216,6 +215,113 @@ public static class ManualMapper
         finally
         {
             FFI.CloseHandleSafe(snap);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Loader stub: DllMain + RIP restore (TLS already handled separately)
+    // ------------------------------------------------------------------
+    private static nint BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, nint originalRip)
+    {
+        var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
+
+        byte[] stub = BuildStubBytes((ulong)moduleBase, (ulong)dllMain, (ulong)originalRip);
+
+        var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
+        FFI.WriteMemory(hProcess, remote, stub);
+        FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
+        return remote;
+    }
+
+    private static byte[] BuildStubBytes(ulong moduleBase, ulong dllMain, ulong originalRip)
+    {
+        List<byte> b = new();
+
+        void Emit(params byte[] bytes) => b.AddRange(bytes);
+        void MovRegImm64(byte reg, ulong imm)
+        {
+            if (reg < 8)
+                Emit(0x48, (byte)(0xB8 + reg));
+            else
+                Emit(0x49, (byte)(0xB8 + (reg - 8)));
+            Emit(BitConverter.GetBytes(imm));
+        }
+
+        // RCX = moduleBase
+        MovRegImm64(1, moduleBase);
+        // EDX = 1 (DLL_PROCESS_ATTACH)
+        Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
+        // XOR R8D,R8D (reserved arg = NULL)
+        Emit(0x41, 0x31, 0xC0);
+        // RAX = dllMain
+        MovRegImm64(0, dllMain);
+        // CALL RAX
+        Emit(0xFF, 0xD0);
+        // RAX = originalRip
+        MovRegImm64(0, originalRip);
+        // JMP RAX
+        Emit(0xFF, 0xE0);
+
+        return b.ToArray();
+    }
+
+    // ------------------------------------------------------------------
+    // PEB unlink
+    // ------------------------------------------------------------------
+    private static void UnlinkFromPEB(nint hProcess, nint moduleBase)
+    {
+        // Query PEB
+        var status = FFI.NtQueryInformationProcess(hProcess, FFI.PROCESSINFOCLASS.ProcessBasicInformation, out var pbi, Marshal.SizeOf<FFI.PROCESS_BASIC_INFORMATION>(), out _);
+        if (status != 0) return;
+        nint peb = pbi.PebBaseAddress;
+        // Offsets for x64 (could vary by build, but stable for Win10/11)
+        const int offsetLdr = 0x18;
+        const int offsetInLoadOrder = 0x10;
+        const int entryOffsetDllBase = 0x30;
+        const int entryOffsetInLoad = 0x00;
+        const int entryOffsetInMem = 0x10;
+        const int entryOffsetInInit = 0x20;
+
+        byte[] buf8 = new byte[8];
+        // Read Ldr
+        FFI.ReadProcessMemory(hProcess, peb + offsetLdr, buf8, 8, out _);
+        nint ldr = (nint)BitConverter.ToInt64(buf8);
+        // Read list head
+        FFI.ReadProcessMemory(hProcess, ldr + offsetInLoadOrder, buf8, 8, out _);
+        nint listHead = (nint)BitConverter.ToInt64(buf8);
+        nint current = listHead;
+        int safety = 0;
+        while (safety++ < 256)
+        {
+            // Read dll base
+            byte[] dllBuf = new byte[8];
+            FFI.ReadProcessMemory(hProcess, current + entryOffsetDllBase, dllBuf, 8, out _);
+            nint dllBaseRead = (nint)BitConverter.ToInt64(dllBuf);
+            if (dllBaseRead == moduleBase)
+            {
+                // Unlink in all three lists
+                void Unlink(int offset)
+                {
+                    byte[] flinkBuf = new byte[8];
+                    byte[] blinkBuf = new byte[8];
+                    FFI.ReadProcessMemory(hProcess, current + offset, flinkBuf, 8, out _);
+                    FFI.ReadProcessMemory(hProcess, current + offset + 8, blinkBuf, 8, out _);
+                    nint flink = (nint)BitConverter.ToInt64(flinkBuf);
+                    nint blink = (nint)BitConverter.ToInt64(blinkBuf);
+                    // blink->Flink = flink
+                    FFI.WriteMemory(hProcess, blink, BitConverter.GetBytes((ulong)flink));
+                    // flink->Blink = blink
+                    FFI.WriteMemory(hProcess, flink + 8, BitConverter.GetBytes((ulong)blink));
+                }
+                Unlink(entryOffsetInLoad);
+                Unlink(entryOffsetInMem);
+                Unlink(entryOffsetInInit);
+                break;
+            }
+            // Next entry
+            FFI.ReadProcessMemory(hProcess, current, buf8, 8, out _);
+            current = (nint)BitConverter.ToInt64(buf8);
+            if (current == listHead || current == nint.Zero) break;
         }
     }
 
@@ -241,55 +347,9 @@ public static class ManualMapper
             ulong cb = BitConverter.ToUInt64(callbackAddrBytes);
             if (cb == 0) break;
 
-            // Create proper TLS callback stub that matches expected signature: void callback(PVOID h, DWORD reason, PVOID reserved)
-            InvokeTlsCallback(hProcess, (nint)cb, remoteBase);
+            // Invoke callback with DllHandle parameter (remoteBase). Reason & reserved will be garbage, but many callbacks ignore them.
+            FFI.CreateRemoteThreadAndWait(hProcess, (nint)cb, remoteBase, true);
             index++;
         }
-    }
-
-    private static void InvokeTlsCallback(nint hProcess, nint callbackAddr, nint dllHandle)
-    {
-        // x64 assembly stub to call TLS callback with proper parameters:
-        // mov rcx, dllHandle     ; 1st param (HMODULE)
-        // mov rdx, 1             ; 2nd param (DLL_PROCESS_ATTACH)
-        // xor r8, r8             ; 3rd param (NULL reserved)
-        // call callbackAddr      ; call the TLS callback
-        // ret                    ; return
-        
-        byte[] stubCode = [
-            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, dllHandle (10 bytes)
-            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,                   // mov rdx, 1 (7 bytes)
-            0x4D, 0x31, 0xC0,                                           // xor r8, r8 (3 bytes)
-            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, callbackAddr (10 bytes)
-            0xFF, 0xD0,                                                 // call rax (2 bytes)
-            0xC3                                                        // ret (1 byte)
-        ];
-
-        // Patch in the actual addresses
-        BitConverter.GetBytes((ulong)dllHandle).CopyTo(stubCode, 2);     // dllHandle at offset 2
-        BitConverter.GetBytes((ulong)callbackAddr).CopyTo(stubCode, 22); // callbackAddr at offset 22
-
-        // Allocate executable memory for stub
-        var stubAddr = FFI.AllocateMemory(hProcess, (uint)stubCode.Length, FFI.PAGE_EXECUTE_READWRITE);
-        
-        try
-        {
-            FFI.WriteMemory(hProcess, stubAddr, stubCode);
-            FFI.CreateRemoteThreadAndWait(hProcess, stubAddr, nint.Zero, true);
-        }
-        finally
-        {
-            FFI.FreeMemory(hProcess, stubAddr);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // String obfuscation helper
-    // ------------------------------------------------------------------
-
-    private static string DeobfuscateString(string obfuscated)
-    {
-        // Simple XOR obfuscation with key 3
-        return new string(obfuscated.Select(c => (char)(c ^ 3)).ToArray());
     }
 }

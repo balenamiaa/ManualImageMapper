@@ -219,4 +219,22 @@ public static partial class FFI
         [FieldOffset(0)]
         public ulong AddressOfData;
     }
-} 
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_BASIC_INFORMATION
+    {
+        public nint Reserved1;
+        public nint PebBaseAddress;
+        public nint Reserved2_0;
+        public nint Reserved2_1;
+        public nint UniqueProcessId;
+        public nint Reserved3;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LIST_ENTRY
+    {
+        public nint Flink;
+        public nint Blink;
+    }
+}
