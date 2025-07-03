@@ -7,7 +7,7 @@ using Serilog;
 namespace ManualImageMapper;
 
 /// <summary>
-/// Represents different injection modes with their associated configuration.
+/// Different injection modes with their associated configuration.
 /// </summary>
 public abstract record InjectionMode
 {
@@ -16,57 +16,46 @@ public abstract record InjectionMode
 }
 
 /// <summary>
-/// Thin, demo-oriented manual mapper that uses FFI helpers. Not battle-tested, but shows all moving pieces.
+/// Manual PE loader that injects DLLs into remote processes using thread hijacking or CreateRemoteThread.
 /// </summary>
 public static class ManualMapper
 {
     private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(ManualMapper));
 
     /// <summary>
-    /// Performs a complete manual map of <paramref name="dllBytes"/> into <paramref name="pid"/> and executes DllMain.
+    /// Performs complete manual mapping of a DLL into a target process and executes DllMain.
     /// </summary>
-    /// <param name="mode">The injection mode and its configuration</param>
     public static void Inject(byte[] dllBytes, int pid, InjectionMode mode)
     {
-        // Parse PE
         var nt = FFI.GetNtHeaders(dllBytes);
         var sections = FFI.GetSectionHeaders(dllBytes);
 
         Log.Information("Opening target process {Pid}", pid);
-        // 1. Open target
         var hProcess = FFI.OpenTargetProcess(pid);
         try
         {
             Log.Debug("Allocating {Size} bytes in target", nt.OptionalHeader.SizeOfImage);
-            // 2. Allocate memory for entire image (headers + sections) RW
             var remoteBase = FFI.AllocateMemory(hProcess, nt.OptionalHeader.SizeOfImage);
 
             Log.Debug("Copying headers ({HeaderSize} bytes)", nt.OptionalHeader.SizeOfHeaders);
-            // 3. Copy headers
             FFI.WriteMemory(hProcess, remoteBase, dllBytes.AsSpan(0, (int)nt.OptionalHeader.SizeOfHeaders).ToArray());
 
             Log.Debug("Mapping {SectionCount} sections", sections.Count);
-            // 4. Map sections – keep them RW for now
             FFI.MapSections(hProcess, remoteBase, dllBytes, sections);
 
             Log.Debug("Applying relocations");
-            // 5. Perform relocations
             ApplyRelocations(hProcess, remoteBase, dllBytes, nt, sections);
 
             Log.Debug("Resolving imports");
-            // 6. Resolve imports (best-effort using local addresses)
             ResolveImports(hProcess, remoteBase, dllBytes, nt, sections);
 
             Log.Debug("Setting final section protections");
-            // 7. Apply final section protections now that patching is done
             FFI.SetSectionProtections(hProcess, remoteBase, sections);
 
             Log.Debug("Flushing instruction cache & erasing headers");
-            // 8. Finalise – flush cache, erase headers (TLS callbacks handled via stub)
             FFI.FlushInstructionCache(hProcess, remoteBase, nt.OptionalHeader.SizeOfImage);
             EraseHeaders(hProcess, remoteBase, nt.OptionalHeader.SizeOfHeaders);
 
-            // 9. Execute DllMain based on injection mode
             switch (mode)
             {
                 case InjectionMode.ThreadHijacking hijack:
@@ -80,7 +69,6 @@ public static class ManualMapper
                         return;
                     }
 
-                    // Check debug marker after a brief delay
                     if (hijack.EnableDebugMarker)
                     {
                         Thread.Sleep(hijack.DebugMarkerCheckDelay);
@@ -119,7 +107,6 @@ public static class ManualMapper
             }
 
             Log.Debug("Unlinking module from PEB");
-            // 10. Unlink from PEB lists for stealth
             UnlinkFromPEB(hProcess, remoteBase);
         }
         finally
@@ -130,7 +117,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Applies the relocation table to patch absolute addresses in the remote image.
+    /// Applies PE relocations to patch absolute addresses for the new base address.
     /// </summary>
     private static void ApplyRelocations(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
     {
@@ -138,9 +125,10 @@ public static class ManualMapper
         if (relocDir.Size == 0) return;
 
         var delta = remoteBase.ToInt64() - (long)nt.OptionalHeader.ImageBase;
-
         var localArr = localImage.ToArray();
+
         Log.Debug("Relocation directory size {Size} at RVA 0x{Rva:X}", relocDir.Size, relocDir.VirtualAddress);
+
         int processed = 0;
         int relocBaseOffset = RvaToOffset(relocDir.VirtualAddress, sections);
 
@@ -152,6 +140,7 @@ public static class ManualMapper
 
             int entryCount = ((int)reloc.SizeOfBlock - Marshal.SizeOf<FFI.IMAGE_BASE_RELOCATION>()) / 2;
             Log.Debug("Reloc block VA 0x{BlockVa:X} entries {Count}", reloc.VirtualAddress, entryCount);
+
             for (int i = 0; i < entryCount; i++)
             {
                 ushort entryVal = BitConverter.ToUInt16(localArr, relocBaseOffset + processed + i * 2);
@@ -173,7 +162,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Resolves DLL imports by writing the appropriate function pointers into the remote IAT.
+    /// Resolves DLL imports by writing function pointers into the Import Address Table.
     /// </summary>
     private static void ResolveImports(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
     {
@@ -183,7 +172,9 @@ public static class ManualMapper
         int descriptorSize = Marshal.SizeOf<FFI.IMAGE_IMPORT_DESCRIPTOR>();
         int index = 0;
         var localArr = localImage.ToArray();
+
         Log.Debug("Processing import directory (size {Size}) at RVA 0x{Rva:X}", importDir.Size, importDir.VirtualAddress);
+
         while (true)
         {
             int descOffset = RvaToOffset(importDir.VirtualAddress + (uint)(index * descriptorSize), sections);
@@ -193,12 +184,10 @@ public static class ManualMapper
             string dllName = ReadAnsiString(localArr, desc.Name, sections);
             Log.Debug("Import descriptor {Dll}", dllName);
 
-            // ensure module loaded in remote – load if missing
             var hModuleRemote = FFI.GetModuleHandle(dllName);
             if (hModuleRemote == nint.Zero)
             {
                 Log.Debug("{Dll} not loaded – calling LoadLibraryA", dllName);
-                // allocate ascii string in remote, call LoadLibraryA
                 var bytes = System.Text.Encoding.ASCII.GetBytes(dllName + "\0");
                 var strAddr = FFI.AllocateMemory(hProcess, (uint)bytes.Length, FFI.PAGE_READWRITE);
                 FFI.WriteMemory(hProcess, strAddr, bytes);
@@ -208,7 +197,6 @@ public static class ManualMapper
                 FFI.FreeMemory(hProcess, strAddr);
             }
 
-            // Now fill IAT
             int thunkIdx = 0;
             while (true)
             {
@@ -219,7 +207,7 @@ public static class ManualMapper
 
                 nint funcPtr;
                 string identifier;
-                if ((importRef & 0x8000000000000000) != 0) // ordinal
+                if ((importRef & 0x8000000000000000) != 0)
                 {
                     ushort ordinal = (ushort)(importRef & 0xFFFF);
                     funcPtr = FFI.GetProcAddress(FFI.GetModuleHandle(dllName), ordinal);
@@ -228,7 +216,7 @@ public static class ManualMapper
                 else
                 {
                     uint nameRva = (uint)(importRef & 0x7FFFFFFF_FFFFFFFF);
-                    string funcName = ReadAnsiString(localArr, nameRva + 2, sections); // skip hint
+                    string funcName = ReadAnsiString(localArr, nameRva + 2, sections);
                     funcPtr = FFI.GetProcAddress(FFI.GetModuleHandle(dllName), funcName);
                     identifier = funcName;
                 }
@@ -243,7 +231,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Reads a null-terminated ANSI string from the local PE image given an RVA.
+    /// Reads a null-terminated ANSI string from the PE image at the specified RVA.
     /// </summary>
     private static string ReadAnsiString(byte[] image, uint rva, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
     {
@@ -254,7 +242,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Converts a Relative Virtual Address (RVA) to a file offset using the provided section headers.
+    /// Converts a Relative Virtual Address to file offset using section headers.
     /// </summary>
     private static int RvaToOffset(uint rva, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
     {
@@ -267,12 +255,11 @@ public static class ManualMapper
                 return (int)(rva - start + section.PointerToRawData);
             }
         }
-        // If RVA falls into headers, return as-is
         return (int)rva;
     }
 
     /// <summary>
-    /// Zeroes the PE headers in the remote image for basic stealth.
+    /// Zeroes PE headers in remote memory for basic stealth.
     /// </summary>
     private static void EraseHeaders(nint hProcess, nint remoteBase, uint headerSize)
     {
@@ -282,9 +269,8 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Suspends the first available thread and hijacks its RIP to execute our loader stub.
+    /// Hijacks the first available thread to execute the loader stub.
     /// Prefers non-blocked threads but will wake blocked ones if needed.
-    /// Returns the debug marker address, or Zero if hijacking failed completely.
     /// </summary>
     private static nint HijackFirstThread(int pid, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config)
     {
@@ -433,7 +419,6 @@ public static class ManualMapper
 
         public void Dispose()
         {
-            // Ensure thread is running before closing handle
             uint cnt;
             do { cnt = FFI.ResumeThread(Handle); } while (cnt > 0 && cnt != 0xFFFFFFFF);
             FFI.CloseHandleSafe(Handle);
@@ -475,14 +460,12 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Builds a small shell-code stub that calls TLS callbacks (if any), invokes DllMain, and then returns execution to the original RIP.
-    /// Returns (stubAddress, debugMarkerAddress).
+    /// Creates and writes a loader stub that calls TLS callbacks and DllMain, then returns to original execution.
     /// </summary>
     private static (nint stubAddress, nint debugMarkerAddress) BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, nint originalRip, InjectionMode.ThreadHijacking config)
     {
         var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
 
-        // Build TLS callback array from remote memory
         var tlsDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.TLS];
         List<ulong> callbacks = [];
         if (tlsDir.Size != 0)
@@ -505,14 +488,12 @@ public static class ManualMapper
         }
         Log.Debug("Total TLS callbacks: {Count}", callbacks.Count);
 
-        // Allocate remote callback array
         var arrBytes = new List<byte>();
         foreach (var c in callbacks) arrBytes.AddRange(BitConverter.GetBytes(c));
         arrBytes.AddRange(BitConverter.GetBytes((ulong)0));
         var callbacksRemote = FFI.AllocateMemory(hProcess, (uint)arrBytes.Count, FFI.PAGE_READWRITE);
         FFI.WriteMemory(hProcess, callbacksRemote, [.. arrBytes]);
 
-        // Add debug marker to track stub execution (if enabled)
         nint debugMarker = nint.Zero;
         if (config.EnableDebugMarker)
         {
@@ -537,6 +518,9 @@ public static class ManualMapper
         return (remote, debugMarker);
     }
 
+    /// <summary>
+    /// Generates x64 assembly stub that calls TLS callbacks, DllMain, and jumps to original RIP.
+    /// </summary>
     private static byte[] BuildStubBytes(ulong moduleBase, ulong dllMain, ulong callbacksAddr, ulong originalRip, ulong debugMarker)
     {
         List<byte> b = [];
@@ -551,23 +535,20 @@ public static class ManualMapper
             Emit(BitConverter.GetBytes(imm));
         }
 
-        // Mark stub entry in debug marker (if enabled)
         if (debugMarker != 0)
         {
-            MovRegImm64(0, debugMarker); // RAX = debugMarker address
-            MovRegImm64(1, 0x1111111111111111UL); // RCX = entry marker
-            Emit(0x48, 0x89, 0x08); // mov [rax], rcx
+            MovRegImm64(0, debugMarker);
+            MovRegImm64(1, 0x1111111111111111UL);
+            Emit(0x48, 0x89, 0x08);
         }
 
-        // Save volatile registers (need even number for alignment)
-        Emit(0x50); // push rax
-        Emit(0x51); // push rcx
-        Emit(0x52); // push rdx
-        Emit(0x41, 0x50); // push r8
-        Emit(0x53); // push rbx
+        Emit(0x50);
+        Emit(0x51);
+        Emit(0x52);
+        Emit(0x41, 0x50);
+        Emit(0x53);
 
-        // Allocate shadow space (keep 16-byte alignment: 5 pushes = 40 bytes, so subtract 32 for shadow)
-        Emit(0x48, 0x83, 0xEC, 0x20); // sub rsp, 32
+        Emit(0x48, 0x83, 0xEC, 0x20);
 
         if (callbacksAddr != 0)
         {
@@ -588,7 +569,6 @@ public static class ManualMapper
             b[jePos] = (byte)(b.Count - (jePos + 1));
         }
 
-        // Mark before DllMain call (if enabled)
         if (debugMarker != 0)
         {
             MovRegImm64(0, debugMarker);
@@ -596,14 +576,12 @@ public static class ManualMapper
             Emit(0x48, 0x89, 0x08);
         }
 
-        // Call DllMain
         MovRegImm64(1, moduleBase);
         Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
         Emit(0x41, 0x31, 0xC0);
         MovRegImm64(0, dllMain);
         Emit(0xFF, 0xD0);
 
-        // Mark after DllMain call (if enabled)
         if (debugMarker != 0)
         {
             MovRegImm64(0, debugMarker);
@@ -611,13 +589,12 @@ public static class ManualMapper
             Emit(0x48, 0x89, 0x08);
         }
 
-        // Restore stack and registers
-        Emit(0x48, 0x83, 0xC4, 0x20); // add rsp, 32
-        Emit(0x5B); // pop rbx
-        Emit(0x41, 0x58); // pop r8
-        Emit(0x5A); // pop rdx
-        Emit(0x59); // pop rcx
-        Emit(0x58); // pop rax
+        Emit(0x48, 0x83, 0xC4, 0x20);
+        Emit(0x5B);
+        Emit(0x41, 0x58);
+        Emit(0x5A);
+        Emit(0x59);
+        Emit(0x58);
 
         if (originalRip == 0)
         {
@@ -633,15 +610,14 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Unlinks the mapped module from the PEB lists to make it less visible to module inspections.
+    /// Unlinks the mapped module from PEB lists for basic stealth.
     /// </summary>
     private static void UnlinkFromPEB(nint hProcess, nint moduleBase)
     {
-        // Query PEB
         var status = FFI.NtQueryInformationProcess(hProcess, FFI.PROCESSINFOCLASS.ProcessBasicInformation, out var pbi, Marshal.SizeOf<FFI.PROCESS_BASIC_INFORMATION>(), out _);
         if (status != 0) return;
+
         nint peb = pbi.PebBaseAddress;
-        // Offsets for x64 (could vary by build, but stable for Win10/11)
         const int offsetLdr = 0x18;
         const int offsetInLoadOrder = 0x10;
         const int entryOffsetDllBase = 0x30;
@@ -650,23 +626,20 @@ public static class ManualMapper
         const int entryOffsetInInit = 0x20;
 
         byte[] buf8 = new byte[8];
-        // Read Ldr
         FFI.ReadProcessMemory(hProcess, peb + offsetLdr, buf8, 8, out _);
         nint ldr = (nint)BitConverter.ToInt64(buf8);
-        // Read list head
         FFI.ReadProcessMemory(hProcess, ldr + offsetInLoadOrder, buf8, 8, out _);
         nint listHead = (nint)BitConverter.ToInt64(buf8);
         nint current = listHead;
         int safety = 0;
+
         while (safety++ < 256)
         {
-            // Read dll base
             byte[] dllBuf = new byte[8];
             FFI.ReadProcessMemory(hProcess, current + entryOffsetDllBase, dllBuf, 8, out _);
             nint dllBaseRead = (nint)BitConverter.ToInt64(dllBuf);
             if (dllBaseRead == moduleBase)
             {
-                // Unlink in all three lists
                 void Unlink(int offset)
                 {
                     byte[] flinkBuf = new byte[8];
@@ -675,17 +648,16 @@ public static class ManualMapper
                     FFI.ReadProcessMemory(hProcess, current + offset + 8, blinkBuf, 8, out _);
                     nint flink = (nint)BitConverter.ToInt64(flinkBuf);
                     nint blink = (nint)BitConverter.ToInt64(blinkBuf);
-                    // blink->Flink = flink
                     FFI.WriteMemory(hProcess, blink, BitConverter.GetBytes((ulong)flink));
-                    // flink->Blink = blink
                     FFI.WriteMemory(hProcess, flink + 8, BitConverter.GetBytes((ulong)blink));
                 }
+
                 Unlink(entryOffsetInLoad);
                 Unlink(entryOffsetInMem);
                 Unlink(entryOffsetInInit);
                 break;
             }
-            // Next entry
+
             FFI.ReadProcessMemory(hProcess, current, buf8, 8, out _);
             current = (nint)BitConverter.ToInt64(buf8);
             if (current == listHead || current == nint.Zero) break;
@@ -693,7 +665,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Creates a small stub that calls DllMain with proper parameters: DllMain(hInstance, DLL_PROCESS_ATTACH, NULL)
+    /// Creates a wrapper stub that calls DllMain with proper parameters for CreateRemoteThread.
     /// </summary>
     private static nint CreateDllMainWrapper(nint hProcess, ulong dllMain, ulong moduleBase)
     {
@@ -708,26 +680,16 @@ public static class ManualMapper
             Emit(BitConverter.GetBytes(imm));
         }
 
-        // Allocate shadow space (32 bytes) + align stack to 16-byte boundary
-        Emit(0x48, 0x83, 0xEC, 0x28); // sub rsp, 40 (32 shadow + 8 for alignment)
+        Emit(0x48, 0x83, 0xEC, 0x28);
 
-        // Set up DllMain parameters
-        // RCX = hInstance (moduleBase)
         MovRegImm64(1, moduleBase);
-        // RDX = fdwReason (DLL_PROCESS_ATTACH = 1)
         Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
-        // R8 = lpvReserved (NULL)
-        Emit(0x41, 0x31, 0xC0); // xor r8d, r8d
+        Emit(0x41, 0x31, 0xC0);
+        MovRegImm64(0, dllMain);
+        Emit(0xFF, 0xD0);
 
-        // Call DllMain
-        MovRegImm64(0, dllMain); // RAX = dllMain
-        Emit(0xFF, 0xD0); // call rax
-
-        // Restore stack
-        Emit(0x48, 0x83, 0xC4, 0x28); // add rsp, 40
-
-        // Return
-        Emit(0xC3); // ret
+        Emit(0x48, 0x83, 0xC4, 0x28);
+        Emit(0xC3);
 
         var stub = b.ToArray();
         var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
@@ -738,8 +700,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Heuristic check: returns true if RIP points inside a common system module (ntdll/kernel32/...) in the current process.
-    /// Remote module bases often match due to ASLR sharing, good enough for deciding whether the thread is likely in a wait syscall.
+    /// Heuristic check for whether RIP points inside common system modules.
     /// </summary>
     private static bool IsRipInSystemModule(ulong rip)
     {
@@ -761,7 +722,6 @@ public static class ManualMapper
             var h = FFI.GetModuleHandle(name);
             if (h != nint.Zero)
             {
-                // Assume 4 MB per module – sufficient coverage for heuristics
                 list.Add(((ulong)h, 0x400000UL));
             }
         }
@@ -769,7 +729,7 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Attempts to wake a thread that might be stuck in a wait by alerting it and posting a dummy message.
+    /// Attempts to wake a blocked thread using PostThreadMessage and NtAlertThread.
     /// </summary>
     private static void WakeThread(uint tid, nint hThread)
     {

@@ -4,7 +4,7 @@ using Serilog;
 
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Verbose()
+    .MinimumLevel.Debug()
     .WriteTo.Console()
     .CreateLogger();
 
@@ -25,7 +25,7 @@ string method = cmdArgs.Length > 3 ? cmdArgs[3].ToLowerInvariant() : "hijack";
 
 InjectionMode injectionMode = method switch
 {
-    "hijack" or "h" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: true, LogGeneratedStub: true),
+    "hijack" or "h" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: false, LogGeneratedStub: false),
     "thread" or "t" => new InjectionMode.CreateRemoteThread(),
     _ => throw new ArgumentException($"Invalid method '{cmdArgs[3]}'. Use 'hijack' or 'thread'.")
 };

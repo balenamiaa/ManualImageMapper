@@ -5,7 +5,9 @@ using Serilog;
 
 namespace ManualImageMapper;
 
-
+/// <summary>
+/// Foreign Function Interface providing Win32 API wrappers and PE manipulation utilities.
+/// </summary>
 public static partial class FFI
 {
     private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(FFI));
@@ -131,16 +133,10 @@ public static partial class FFI
 
     #endregion
 
-
     #region Higher Level Methods
 
-    // ---------------------------------------------------------------------
-    // Process / memory convenience wrappers
-    // ---------------------------------------------------------------------
-
     /// <summary>
-    /// Opens the target process with PROCESS_ALL_ACCESS and returns the handle.
-    /// Throws on failure.N
+    /// Opens the target process with PROCESS_ALL_ACCESS. Throws on failure.
     /// </summary>
     public static nint OpenTargetProcess(int pid)
     {
@@ -152,7 +148,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Closes a process / object handle. Safe to call with IntPtr.Zero.
+    /// Safely closes a handle, ignoring zero handles.
     /// </summary>
     public static void CloseHandleSafe(nint handle)
     {
@@ -163,7 +159,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Allocates memory in the remote process (MEM_COMMIT | MEM_RESERVE).
+    /// Allocates memory in the remote process with MEM_COMMIT | MEM_RESERVE.
     /// </summary>
     public static nint AllocateMemory(nint hProcess, uint size, uint protection = PAGE_READWRITE)
     {
@@ -195,7 +191,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Reads <paramref name="size"/> bytes from the remote address.
+    /// Reads bytes from the remote address.
     /// </summary>
     public static byte[] ReadMemory(nint hProcess, nint baseAddress, int size)
     {
@@ -206,8 +202,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Changes the protection of a remote memory region.
-    /// Returns the old protection value.
+    /// Changes the protection of a remote memory region and returns the old protection.
     /// </summary>
     public static uint ProtectMemory(nint hProcess, nint address, uint size, uint newProtect)
     {
@@ -219,7 +214,6 @@ public static partial class FFI
 
     /// <summary>
     /// Creates a remote thread and optionally waits for it to finish.
-    /// Returns the thread handle.
     /// </summary>
     public static nint CreateRemoteThreadAndWait(nint hProcess, nint startAddress, nint parameter, bool wait = true)
     {
@@ -233,20 +227,14 @@ public static partial class FFI
         {
             WaitForSingleObject(hThread, INFINITE);
             Log.Verbose("Waited for thread 0x{Thread:X} to finish", (ulong)hThread);
-
             CloseHandleSafe(hThread);
-
             return nint.Zero;
         }
         return hThread;
     }
 
-    // ---------------------------------------------------------------------
-    // PE parsing helpers (local – operates on the DLL image bytes)
-    // ---------------------------------------------------------------------
-
     /// <summary>
-    /// Converts a raw byte buffer to a structure of type T.
+    /// Converts a raw byte buffer to a structure.
     /// </summary>
     public static T BytesToStructure<T>(byte[] buffer, int offset = 0) where T : struct
     {
@@ -263,12 +251,12 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Reads the DOS header from the in-memory image.
+    /// Reads the DOS header from the PE image.
     /// </summary>
     public static IMAGE_DOS_HEADER GetDosHeader(byte[] image) => BytesToStructure<IMAGE_DOS_HEADER>(image, 0);
 
     /// <summary>
-    /// Reads the NT headers from the in-memory image.
+    /// Reads the NT headers from the PE image.
     /// </summary>
     public static IMAGE_NT_HEADERS64 GetNtHeaders(byte[] image)
     {
@@ -294,17 +282,12 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Aligns <paramref name="value"/> up to the next multiple of <paramref name="alignment"/>.
+    /// Aligns value up to the next multiple of alignment.
     /// </summary>
     public static uint AlignUp(uint value, uint alignment) => (value + alignment - 1) & ~(alignment - 1);
 
-    // ---------------------------------------------------------------------
-    // Section specific helpers
-    // ---------------------------------------------------------------------
-
     /// <summary>
-    /// Maps section <see cref="SectionCharacteristics"/> flag combinations to PAGE_* protection flags.
-    /// The mapping is simplified but sufficient for typical DLL sections.
+    /// Maps PE section characteristics to Windows memory protection flags.
     /// </summary>
     public static uint CharacteristicsToProtection(uint characteristics)
     {
@@ -320,12 +303,12 @@ public static partial class FFI
             (true, true, false) => PAGE_EXECUTE_READ,
             (true, true, true) => PAGE_EXECUTE_READWRITE,
             (true, false, false) => PAGE_EXECUTE,
-            _ => PAGE_NOACCESS // fallback (rare)
+            _ => PAGE_NOACCESS
         };
     }
 
     /// <summary>
-    /// Writes each PE section into remote memory. By default sections stay RW; set <paramref name="applyFinalProtection"/> to <c>true</c> to immediately assign final RX/RWX permissions.
+    /// Maps PE sections into remote memory. Sections remain RW unless applyFinalProtection is true.
     /// </summary>
     public static void MapSections(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, IReadOnlyList<IMAGE_SECTION_HEADER> sections, bool applyFinalProtection = false)
     {
@@ -350,7 +333,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Iterates sections and applies their final protection flags (R/O, RX, etc.). Call this after all relocations & IAT patching are finished.
+    /// Applies final protection flags to sections. Call after relocations and IAT patching.
     /// </summary>
     public static void SetSectionProtections(nint hProcess, nint remoteBase, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
     {
@@ -364,8 +347,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Attempts to enable SeDebugPrivilege for the current process to allow thread hijacking.
-    /// Returns true if successful, false otherwise.
+    /// Attempts to enable SeDebugPrivilege for the current process.
     /// </summary>
     public static bool EnableSeDebugPrivilege()
     {
@@ -418,40 +400,32 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Returns true if the specified process is 64-bit. Requires the caller to be 64-bit itself.
+    /// Determines if the specified process is 64-bit.
     /// </summary>
     public static bool IsProcess64Bit(nint hProcess)
     {
-        // If the OS itself is 32-bit we can only have 32-bit processes.
         if (!Environment.Is64BitOperatingSystem)
             return false;
 
-        // Prefer IsWow64Process2 (Win10+)
         try
         {
             if (IsWow64Process2(hProcess, out ushort procMachine, out _))
             {
-                // A value of IMAGE_FILE_MACHINE_UNKNOWN (0) means the process matches the native architecture (i.e. 64-bit).
                 return procMachine == 0;
             }
         }
         catch (EntryPointNotFoundException)
         {
-            // API not present – fall back below
         }
 
-        // Fallback: IsWow64Process – true means the process is running under WOW64 (i.e. 32-bit)
         if (IsWow64Process(hProcess, out bool isWow))
             return !isWow;
 
-        // If the call failed, assume 64-bit so we at least try.
         return true;
     }
 
-
     /// <summary>
-    /// Reads the full CONTEXT64 structure for <paramref name="hThread"/> using a 16-byte-aligned buffer.
-    /// Returns <c>true</c> on success; the output parameter is undefined on failure.
+    /// Reads CONTEXT64 structure using 16-byte-aligned buffer to satisfy GetThreadContext requirements.
     /// </summary>
     public static unsafe bool TryGetThreadContext(nint hThread, out CONTEXT64 context)
     {
@@ -463,7 +437,7 @@ public static partial class FFI
             nint aligned = (nint)(((long)raw + 15) & ~0xF);
             Span<byte> clear = new Span<byte>((void*)aligned, size);
             clear.Clear();
-            Marshal.WriteInt32(aligned, 0x30, (int)CONTEXT_ALL); // ContextFlags offset
+            Marshal.WriteInt32(aligned, 0x30, (int)CONTEXT_ALL);
 
             if (!GetThreadContextRaw(hThread, aligned)) return false;
             context = Marshal.PtrToStructure<CONTEXT64>(aligned)!;
@@ -476,7 +450,7 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Writes the supplied CONTEXT64 to <paramref name="hThread"/> using a 16-byte-aligned buffer.
+    /// Writes CONTEXT64 structure using 16-byte-aligned buffer to satisfy SetThreadContext requirements.
     /// </summary>
     public static unsafe bool TrySetThreadContext(nint hThread, in CONTEXT64 context)
     {
