@@ -71,6 +71,24 @@ public static partial class FFI
     [LibraryImport("kernel32.dll", SetLastError = true)]
     public static partial nint GetCurrentProcess();
 
+    [LibraryImport("kernel32.dll", SetLastError = true, EntryPoint = "IsWow64Process2")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsWow64Process2(nint hProcess, out ushort processMachine, out ushort nativeMachine);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool IsWow64Process(nint hProcess, [MarshalAs(UnmanagedType.Bool)] out bool isWow64);
+
+    [LibraryImport("user32.dll", SetLastError = true, EntryPoint = "PostThreadMessageW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool PostThreadMessage(uint idThread, uint msg, nuint wParam, nint lParam);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial uint QueueUserAPC(nint pfnAPC, nint hThread, nuint dwData);
+
+    [LibraryImport("ntdll.dll")]
+    public static partial uint NtAlertThread(nint hThread);
+
     #endregion
 
 
@@ -134,7 +152,6 @@ public static partial class FFI
     {
         if (!WriteProcessMemory(hProcess, baseAddress, data, (uint)data.Length, out _))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WriteProcessMemory failed");
-        Log.Verbose("Wrote {Len} bytes to 0x{Addr:X}", data.Length, (ulong)baseAddress);
     }
 
     /// <summary>
@@ -145,7 +162,6 @@ public static partial class FFI
         var buffer = new byte[size];
         if (!ReadProcessMemory(hProcess, baseAddress, buffer, size, out _))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "ReadProcessMemory failed");
-        Log.Verbose("Read {Len} bytes from 0x{Addr:X}", size, (ulong)baseAddress);
         return buffer;
     }
 
@@ -176,9 +192,10 @@ public static partial class FFI
         if (wait)
         {
             WaitForSingleObject(hThread, INFINITE);
-            // Close handle when we are done waiting – caller usually doesn't need it
             Log.Verbose("Waited for thread 0x{Thread:X} to finish", (ulong)hThread);
+
             CloseHandleSafe(hThread);
+
             return nint.Zero;
         }
         return hThread;
@@ -357,6 +374,83 @@ public static partial class FFI
         {
             Log.Warning(ex, "Exception while enabling SeDebugPrivilege");
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the specified process is 64-bit. Requires the caller to be 64-bit itself.
+    /// </summary>
+    public static bool IsProcess64Bit(nint hProcess)
+    {
+        // If the OS itself is 32-bit we can only have 32-bit processes.
+        if (!Environment.Is64BitOperatingSystem)
+            return false;
+
+        // Prefer IsWow64Process2 (Win10+)
+        try
+        {
+            if (IsWow64Process2(hProcess, out ushort procMachine, out _))
+            {
+                // A value of IMAGE_FILE_MACHINE_UNKNOWN (0) means the process matches the native architecture (i.e. 64-bit).
+                return procMachine == 0;
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // API not present – fall back below
+        }
+
+        // Fallback: IsWow64Process – true means the process is running under WOW64 (i.e. 32-bit)
+        if (IsWow64Process(hProcess, out bool isWow))
+            return !isWow;
+
+        // If the call failed, assume 64-bit so we at least try.
+        return true;
+    }
+
+
+    /// <summary>
+    /// Reads the full CONTEXT64 structure for <paramref name="hThread"/> using a 16-byte-aligned buffer.
+    /// Returns <c>true</c> on success; the output parameter is undefined on failure.
+    /// </summary>
+    public static unsafe bool TryGetThreadContext(nint hThread, out CONTEXT64 context)
+    {
+        context = default;
+        int size = Marshal.SizeOf<CONTEXT64>();
+        nint raw = Marshal.AllocHGlobal(size + 16);
+        try
+        {
+            nint aligned = (nint)(((long)raw + 15) & ~0xF);
+            Span<byte> clear = new Span<byte>((void*)aligned, size);
+            clear.Clear();
+            Marshal.WriteInt32(aligned, 0x30, (int)CONTEXT_ALL); // ContextFlags offset
+
+            if (!GetThreadContextRaw(hThread, aligned)) return false;
+            context = Marshal.PtrToStructure<CONTEXT64>(aligned)!;
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(raw);
+        }
+    }
+
+    /// <summary>
+    /// Writes the supplied CONTEXT64 to <paramref name="hThread"/> using a 16-byte-aligned buffer.
+    /// </summary>
+    public static unsafe bool TrySetThreadContext(nint hThread, in CONTEXT64 context)
+    {
+        int size = Marshal.SizeOf<CONTEXT64>();
+        nint raw = Marshal.AllocHGlobal(size + 16);
+        try
+        {
+            nint aligned = (nint)(((long)raw + 15) & ~0xF);
+            Marshal.StructureToPtr(context, aligned, false);
+            return SetThreadContextRaw(hThread, aligned);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(raw);
         }
     }
 

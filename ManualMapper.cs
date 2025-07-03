@@ -11,7 +11,7 @@ namespace ManualImageMapper;
 /// </summary>
 public abstract record InjectionMode
 {
-    public sealed record ThreadHijacking(bool EnableDebugPrivilege = true) : InjectionMode;
+    public sealed record ThreadHijacking(TimeSpan DebugMarkerCheckDelay, bool EnableDebugPrivilege = true, bool EnableDebugMarker = false, bool LogGeneratedStub = false) : InjectionMode;
     public sealed record CreateRemoteThread(uint TimeoutMs = 30_000) : InjectionMode;
 }
 
@@ -70,8 +70,31 @@ public static class ManualMapper
             switch (mode)
             {
                 case InjectionMode.ThreadHijacking hijack:
-                    Log.Information("Hijacking thread to execute DllMain (debug privilege: {EnableDebug})", hijack.EnableDebugPrivilege);
-                    HijackFirstThread(pid, hProcess, remoteBase, nt, hijack.EnableDebugPrivilege);
+                    Log.Information("Hijacking thread to execute DllMain (debug privilege: {EnableDebug}, debug marker: {EnableMarker}, log stub: {LogStub})",
+                        hijack.EnableDebugPrivilege, hijack.EnableDebugMarker, hijack.LogGeneratedStub);
+                    var debugMarker = HijackFirstThread(pid, hProcess, remoteBase, nt, hijack);
+
+                    if (debugMarker == nint.Zero)
+                    {
+                        Log.Warning("Failed to hijack any thread. Stopping injection.");
+                        return;
+                    }
+
+                    // Check debug marker after a brief delay
+                    if (hijack.EnableDebugMarker)
+                    {
+                        Thread.Sleep(hijack.DebugMarkerCheckDelay);
+                        try
+                        {
+                            var markerValue = FFI.ReadMemory(hProcess, debugMarker, 8);
+                            var value = BitConverter.ToUInt64(markerValue);
+                            Log.Debug("Debug marker result: 0x{Value:X} (entry=0x1111111111111111, preDllMain=0x2222222222222222, postDllMain=0x1337DEADBEEFCAFE)", value);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warning(ex, "Failed to read debug marker");
+                        }
+                    }
                     break;
 
                 case InjectionMode.CreateRemoteThread remoteThread:
@@ -181,7 +204,7 @@ public static class ManualMapper
                 FFI.WriteMemory(hProcess, strAddr, bytes);
 
                 var loadLib = FFI.GetProcAddress(FFI.GetModuleHandle("kernel32.dll"), "LoadLibraryA");
-                FFI.CreateRemoteThreadAndWait(hProcess, loadLib, strAddr);
+                FFI.CreateRemoteThreadAndWait(hProcess, loadLib, strAddr, wait: false);
                 FFI.FreeMemory(hProcess, strAddr);
             }
 
@@ -259,87 +282,201 @@ public static class ManualMapper
     }
 
     /// <summary>
-    /// Suspends the first thread of the target process and hijacks its RIP to execute our loader stub.
+    /// Suspends the first available thread and hijacks its RIP to execute our loader stub.
+    /// Prefers non-blocked threads but will wake blocked ones if needed.
+    /// Returns the debug marker address, or Zero if hijacking failed completely.
     /// </summary>
-    private static void HijackFirstThread(int pid, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, bool enableDebugPrivilege)
+    private static nint HijackFirstThread(int pid, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config)
     {
-        // Try to enable SeDebugPrivilege for better thread access
-        if (enableDebugPrivilege)
+        var currentProcess = FFI.GetCurrentProcess();
+        bool currentIs64 = FFI.IsProcess64Bit(currentProcess);
+        bool targetIs64 = FFI.IsProcess64Bit(hProcess);
+        
+        Log.Debug("Architecture check: current process 64-bit={Current}, target process 64-bit={Target}", currentIs64, targetIs64);
+        
+        if (!targetIs64)
         {
-            FFI.EnableSeDebugPrivilege();
+            Log.Warning("Target process is 32-bit (WOW64). Thread-hijacking only supports x64");
+            return nint.Zero;
         }
 
-        var snap = FFI.CreateToolhelp32Snapshot(FFI.TH32CS_SNAPTHREAD, 0);
-        if (snap == nint.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        if (config.EnableDebugPrivilege) FFI.EnableSeDebugPrivilege();
+
+        using var snap = new ThreadSnapshot(pid);
+        var (activeThread, blockedThread) = FindCandidateThreads(snap);
+
+        return (activeThread, blockedThread) switch
+        {
+            ({ } active, _) => HijackThread(active, hProcess, moduleBase, nt, config, needsWakeup: false),
+            (null, { } blocked) => HijackThread(blocked, hProcess, moduleBase, nt, config, needsWakeup: true),
+            _ => throw new Exception("Failed to hijack any thread")
+        };
+    }
+
+    private static (ThreadInfo? active, ThreadInfo? blocked) FindCandidateThreads(ThreadSnapshot snap)
+    {
+        ThreadInfo? firstBlocked = null;
+        var threadsToDispose = new List<ThreadInfo>();
+        int totalThreads = 0, accessibleThreads = 0, validRipThreads = 0;
 
         try
         {
-            FFI.THREADENTRY32 entry = new()
+            foreach (var thread in snap.EnumerateThreads())
             {
-                dwSize = (uint)Marshal.SizeOf<FFI.THREADENTRY32>()
-            };
-            if (!FFI.Thread32First(snap, ref entry)) return;
-            bool hijacked = false;
-            do
-            {
-                if (entry.th32OwnerProcessID != (uint)pid) continue;
-                var hThread = FFI.OpenThread(FFI.THREAD_ALL_ACCESS, false, entry.th32ThreadID);
-                if (hThread == nint.Zero) continue;
-
-                try
+                totalThreads++;
+                threadsToDispose.Add(thread);
+                
+                if (!thread.TryGetContext(out var ctx)) 
                 {
-                    FFI.SuspendThread(hThread);
-                    var ctx = new FFI.CONTEXT64 { ContextFlags = FFI.CONTEXT_ALL };
-                    if (!FFI.GetThreadContext(hThread, ref ctx))
-                    {
-                        Log.Warning("GetThreadContext failed for TID {Tid} (err {Err})", entry.th32ThreadID, Marshal.GetLastWin32Error());
-                        FFI.ResumeThread(hThread);
-                        continue;
-                    }
-                    if (ctx.Rip == 0)
-                    {
-                        Log.Warning("Thread {Tid} has RIP=0 – skipping", entry.th32ThreadID);
-                        FFI.ResumeThread(hThread);
-                        continue;
-                    }
-
-                    nint stubAddr = BuildAndWriteLoaderStub(hProcess, moduleBase, nt, (nint)ctx.Rip);
-                    Log.Debug("Thread {Tid}: original RIP 0x{Rip:X} -> stub 0x{Stub:X}", entry.th32ThreadID, ctx.Rip, (ulong)stubAddr);
-                    ctx.Rip = (ulong)stubAddr;
-                    FFI.SetThreadContext(hThread, ref ctx);
-                    FFI.ResumeThread(hThread);
-                    Log.Debug("Resumed thread {Tid}", entry.th32ThreadID);
-                    hijacked = true;
-                    break; // hijacked one thread, good enough
+                    Log.Verbose("Thread {Tid}: GetThreadContext failed", thread.Id);
+                    continue;
                 }
-                finally
+                accessibleThreads++;
+                
+                if (ctx.Rip == 0) 
                 {
-                    FFI.CloseHandleSafe(hThread);
+                    Log.Verbose("Thread {Tid}: RIP is zero", thread.Id);
+                    continue;
                 }
-            } while (FFI.Thread32Next(snap, ref entry));
+                validRipThreads++;
 
-            if (!hijacked)
-            {
-                Log.Warning("Failed to hijack any thread – falling back to CreateRemoteThread");
-                var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
-                var wrapperStub = CreateDllMainWrapper(hProcess, (ulong)dllMain, (ulong)moduleBase);
-                FFI.CreateRemoteThreadAndWait(hProcess, wrapperStub, nint.Zero, wait: false);
+                bool isBlocked = IsRipInSystemModule(ctx.Rip);
+                Log.Verbose("Thread {Tid}: RIP=0x{Rip:X}, blocked={Blocked}", thread.Id, ctx.Rip, isBlocked);
+                
+                if (!isBlocked) 
+                {
+                    threadsToDispose.Remove(thread);
+                    Log.Debug("Found active thread {Tid}", thread.Id);
+                    return (thread, null);
+                }
+                
+                if (firstBlocked == null)
+                {
+                    firstBlocked = thread;
+                    threadsToDispose.Remove(thread);
+                    Log.Debug("Found blocked thread {Tid} as fallback", thread.Id);
+                }
             }
+
+            Log.Information("Thread scan: {Total} total, {Accessible} accessible, {ValidRip} valid RIP, active={HasActive}, blocked={BlockedId}", 
+                totalThreads, accessibleThreads, validRipThreads, firstBlocked == null, firstBlocked?.Id ?? 0);
+            return (null, firstBlocked);
         }
         finally
         {
-            FFI.CloseHandleSafe(snap);
+            foreach (var thread in threadsToDispose)
+                thread.Dispose();
         }
+    }
+
+    private static nint HijackThread(ThreadInfo thread, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config, bool needsWakeup)
+    {
+        try
+        {
+            if (!thread.TryGetContext(out var ctx)) 
+                throw new Exception($"Failed to get context for thread {thread.Id}");
+
+            var (stubAddr, debugMarker) = BuildAndWriteLoaderStub(hProcess, moduleBase, nt, (nint)ctx.Rip, config);
+            
+            ctx.Rip = (ulong)stubAddr;
+            if (!thread.TrySetContext(ctx))
+                throw new Exception($"Failed to set context for thread {thread.Id}");
+
+            thread.ResumeCompletely();
+            
+            if (needsWakeup) WakeThread(thread.Id, thread.Handle);
+            
+            Log.Debug("Hijacked thread {Tid} (RIP: 0x{Rip:X} -> 0x{Stub:X})", thread.Id, ctx.Rip, (ulong)stubAddr);
+            return debugMarker;
+        }
+        finally
+        {
+            thread.Dispose();
+        }
+    }
+
+    private readonly record struct ThreadInfo(uint Id, nint Handle)
+    {
+        public bool TryGetContext(out FFI.CONTEXT64 ctx)
+        {
+            ctx = default;
+            var suspend = FFI.SuspendThread(Handle);
+            if (suspend == 0xFFFFFFFF)
+            {
+                Log.Verbose("Thread {Tid}: SuspendThread failed (err {Err})", Id, Marshal.GetLastWin32Error());
+                return false;
+            }
+
+            if (!FFI.TryGetThreadContext(Handle, out ctx))
+            {
+                FFI.ResumeThread(Handle);
+                return false;
+            }
+
+            return true;
+        }
+
+        public bool TrySetContext(FFI.CONTEXT64 ctx)
+        {
+            bool success = FFI.TrySetThreadContext(Handle, ctx);
+            if (!success)
+                FFI.ResumeThread(Handle);
+            return success;
+        }
+
+        public void ResumeCompletely()
+        {
+            uint count;
+            do { count = FFI.ResumeThread(Handle); } 
+            while (count > 0 && count != 0xFFFFFFFF);
+        }
+
+        public void Dispose() => FFI.CloseHandleSafe(Handle);
+    }
+
+    private sealed class ThreadSnapshot : IDisposable
+    {
+        private readonly nint _handle;
+        private readonly int _pid;
+
+        public ThreadSnapshot(int pid)
+        {
+            _pid = pid;
+            _handle = FFI.CreateToolhelp32Snapshot(FFI.TH32CS_SNAPTHREAD, 0);
+            if (_handle == nint.Zero) throw new System.ComponentModel.Win32Exception();
+        }
+
+        public IEnumerable<ThreadInfo> EnumerateThreads()
+        {
+            var entry = new FFI.THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<FFI.THREADENTRY32>() };
+            
+            if (!FFI.Thread32First(_handle, ref entry)) yield break;
+
+            do
+            {
+                if (entry.th32OwnerProcessID != (uint)_pid) continue;
+                
+                var hThread = FFI.OpenThread(FFI.THREAD_ALL_ACCESS, false, entry.th32ThreadID);
+                if (hThread == nint.Zero) continue;
+
+                var threadInfo = new ThreadInfo(entry.th32ThreadID, hThread);
+                yield return threadInfo;
+            } 
+            while (FFI.Thread32Next(_handle, ref entry));
+        }
+
+        public void Dispose() => FFI.CloseHandleSafe(_handle);
     }
 
     /// <summary>
     /// Builds a small shell-code stub that calls TLS callbacks (if any), invokes DllMain, and then returns execution to the original RIP.
+    /// Returns (stubAddress, debugMarkerAddress).
     /// </summary>
-    private static nint BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, nint originalRip)
+    private static (nint stubAddress, nint debugMarkerAddress) BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, nint originalRip, InjectionMode.ThreadHijacking config)
     {
         var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
 
-        // Build TLS callback array (if any) from remote memory to avoid CreateRemoteThread
+        // Build TLS callback array from remote memory
         var tlsDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.TLS];
         List<ulong> callbacks = [];
         if (tlsDir.Size != 0)
@@ -362,25 +499,39 @@ public static class ManualMapper
         }
         Log.Debug("Total TLS callbacks: {Count}", callbacks.Count);
 
-        // allocate remote array
+        // Allocate remote callback array
         var arrBytes = new List<byte>();
         foreach (var c in callbacks) arrBytes.AddRange(BitConverter.GetBytes(c));
         arrBytes.AddRange(BitConverter.GetBytes((ulong)0));
         var callbacksRemote = FFI.AllocateMemory(hProcess, (uint)arrBytes.Count, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, callbacksRemote, arrBytes.ToArray());
+        FFI.WriteMemory(hProcess, callbacksRemote, [.. arrBytes]);
 
-        byte[] stub = BuildStubBytes((ulong)moduleBase, (ulong)dllMain, (ulong)callbacksRemote, (ulong)originalRip);
+        // Add debug marker to track stub execution (if enabled)
+        nint debugMarker = nint.Zero;
+        if (config.EnableDebugMarker)
+        {
+            debugMarker = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
+            FFI.WriteMemory(hProcess, debugMarker, BitConverter.GetBytes(0xDEADBEEFCAFEBABEUL));
+            Log.Debug("Debug marker at 0x{Marker:X} (should change to 0x1337DEADBEEFCAFE after DllMain)", (ulong)debugMarker);
+        }
+
+        byte[] stub = BuildStubBytes((ulong)moduleBase, (ulong)dllMain, (ulong)callbacksRemote, (ulong)originalRip, (ulong)debugMarker);
         Log.Debug("Loader stub size {Size} bytes", stub.Length);
+
+        if (config.LogGeneratedStub)
+        {
+            Log.Information("Generated stub bytes: {StubHex}", Convert.ToHexString(stub));
+        }
 
         var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
         FFI.WriteMemory(hProcess, remote, stub);
         FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
-        // Ensure CPU sees fresh instructions
         FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
-        return remote;
+
+        return (remote, debugMarker);
     }
 
-        private static byte[] BuildStubBytes(ulong moduleBase, ulong dllMain, ulong callbacksAddr, ulong originalRip)
+    private static byte[] BuildStubBytes(ulong moduleBase, ulong dllMain, ulong callbacksAddr, ulong originalRip, ulong debugMarker)
     {
         List<byte> b = [];
 
@@ -394,83 +545,85 @@ public static class ManualMapper
             Emit(BitConverter.GetBytes(imm));
         }
 
-        // Save volatile regs we clobber FIRST (before any stack operations)
+        // Mark stub entry in debug marker (if enabled)
+        if (debugMarker != 0)
+        {
+            MovRegImm64(0, debugMarker); // RAX = debugMarker address
+            MovRegImm64(1, 0x1111111111111111UL); // RCX = entry marker
+            Emit(0x48, 0x89, 0x08); // mov [rax], rcx
+        }
+
+        // Save volatile registers
         Emit(0x50); // push rax
         Emit(0x51); // push rcx
         Emit(0x52); // push rdx
         Emit(0x41, 0x50); // push r8
-        Emit(0x53); // push rbx (we'll use it for TLS)
+        Emit(0x53); // push rbx
 
-        // Align stack to 16-byte boundary and allocate shadow space
-        // We've pushed 5 registers (40 bytes), so RSP is 16-byte aligned
-        Emit(0x48, 0x83, 0xEC, 0x20); // sub rsp, 32 (shadow space)
+        // Allocate shadow space (stack should be 16-byte aligned after 5 pushes)
+        Emit(0x48, 0x83, 0xEC, 0x20); // sub rsp, 32
 
-        // If callbacks array != 0, call TLS callbacks first
         if (callbacksAddr != 0)
         {
-            // RBX = callbacksAddr
             MovRegImm64(3, callbacksAddr);
             int loopLabel = b.Count;
-            // RAX = [RBX] (get callback address)
             Emit(0x48, 0x8B, 0x03);
-            // TEST RAX,RAX (check if null)
             Emit(0x48, 0x85, 0xC0);
-            // JZ -> afterCallbacks
             Emit(0x74, 0x00); int jePos = b.Count - 1;
 
-            // Call TLS callback with proper parameters:
-            // RCX = moduleBase (hModule)
             MovRegImm64(1, moduleBase);
-            // RDX = DLL_PROCESS_ATTACH (1)
             Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
-            // R8 = NULL (lpvReserved)
-            Emit(0x41, 0x31, 0xC0); // xor r8d,r8d
-            // Call the TLS callback
-            Emit(0xFF, 0xD0); // call rax
-            
-            // Move to next callback
-            Emit(0x48, 0x83, 0xC3, 0x08); // add rbx,8
-            Emit(0xEB, (byte)(loopLabel - (b.Count + 1))); // jmp loop
+            Emit(0x41, 0x31, 0xC0);
+            Emit(0xFF, 0xD0);
 
-            // patch JZ offset
+            Emit(0x48, 0x83, 0xC3, 0x08);
+            Emit(0xEB, (byte)(loopLabel - (b.Count + 1)));
+
             b[jePos] = (byte)(b.Count - (jePos + 1));
         }
 
-        // Now call DllMain with proper x64 calling convention
-        // RCX = hInstance (moduleBase)
-        MovRegImm64(1, moduleBase);
-        // RDX = fdwReason (DLL_PROCESS_ATTACH = 1)
-        Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
-        // R8 = lpvReserved (NULL)
-        Emit(0x41, 0x31, 0xC0); // xor r8d, r8d
-        
+        // Mark before DllMain call (if enabled)
+        if (debugMarker != 0)
+        {
+            MovRegImm64(0, debugMarker);
+            MovRegImm64(1, 0x2222222222222222UL);
+            Emit(0x48, 0x89, 0x08);
+        }
+
         // Call DllMain
-        MovRegImm64(0, dllMain); // RAX = dllMain
-        Emit(0xFF, 0xD0); // call rax
+        MovRegImm64(1, moduleBase);
+        Emit(0xBA, 0x01, 0x00, 0x00, 0x00);
+        Emit(0x41, 0x31, 0xC0);
+        MovRegImm64(0, dllMain);
+        Emit(0xFF, 0xD0);
 
-        // Restore stack (remove shadow space)
-        Emit(0x48, 0x83, 0xC4, 0x20); // add rsp, 32
+        // Mark after DllMain call (if enabled)
+        if (debugMarker != 0)
+        {
+            MovRegImm64(0, debugMarker);
+            MovRegImm64(1, 0x1337DEADBEEFCAFEUL);
+            Emit(0x48, 0x89, 0x08);
+        }
 
-        // Restore registers in reverse order
-        Emit(0x5B); // pop rbx
-        Emit(0x41, 0x58); // pop r8
-        Emit(0x5A); // pop rdx
-        Emit(0x59); // pop rcx
-        Emit(0x58); // pop rax
+        // Restore stack and registers
+        Emit(0x48, 0x83, 0xC4, 0x20);
+        Emit(0x5B);
+        Emit(0x41, 0x58);
+        Emit(0x5A);
+        Emit(0x59);
+        Emit(0x58);
 
         if (originalRip == 0)
         {
-            // RET
             Emit(0xC3);
         }
         else
         {
-            // JMP originalRip to continue normal execution
-            MovRegImm64(0, originalRip); // RAX = originalRip
-            Emit(0xFF, 0xE0); // jmp rax
+            MovRegImm64(0, originalRip);
+            Emit(0xFF, 0xE0);
         }
 
-        return b.ToArray();
+        return [.. b];
     }
 
     /// <summary>
@@ -576,5 +729,46 @@ public static class ManualMapper
         FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
         FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
         return remote;
+    }
+
+    /// <summary>
+    /// Heuristic check: returns true if RIP points inside a common system module (ntdll/kernel32/...) in the current process.
+    /// Remote module bases often match due to ASLR sharing, good enough for deciding whether the thread is likely in a wait syscall.
+    /// </summary>
+    private static bool IsRipInSystemModule(ulong rip)
+    {
+        foreach (var (baseAddr, size) in _systemModuleRanges)
+        {
+            if (rip >= baseAddr && rip < baseAddr + size) return true;
+        }
+        return false;
+    }
+
+    private static readonly (ulong baseAddr, ulong size)[] _systemModuleRanges = InitRanges();
+
+    private static (ulong, ulong)[] InitRanges()
+    {
+        string[] names = [ "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "win32u.dll" ];
+        List<(ulong, ulong)> list = [];
+        foreach (var name in names)
+        {
+            var h = FFI.GetModuleHandle(name);
+            if (h != nint.Zero)
+            {
+                // Assume 4 MB per module – sufficient coverage for heuristics
+                list.Add(((ulong)h, 0x400000UL));
+            }
+        }
+        return [.. list];
+    }
+
+    /// <summary>
+    /// Attempts to wake a thread that might be stuck in a wait by alerting it and posting a dummy message.
+    /// </summary>
+    private static void WakeThread(uint tid, nint hThread)
+    {
+        const uint WM_NULL = 0x0000;
+        FFI.PostThreadMessage(tid, WM_NULL, 0, nint.Zero);
+        FFI.NtAlertThread(hThread);
     }
 }

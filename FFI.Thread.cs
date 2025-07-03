@@ -118,5 +118,13 @@ public static partial class FFI
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool Thread32Next(nint hSnapshot, ref THREADENTRY32 lpte);
 
+    [LibraryImport("kernel32.dll", EntryPoint = "GetThreadContext", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetThreadContextRaw(nint hThread, nint lpContext);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "SetThreadContext", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetThreadContextRaw(nint hThread, nint lpContext);
+
     #endregion
 }
