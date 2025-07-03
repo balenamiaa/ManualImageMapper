@@ -89,6 +89,46 @@ public static partial class FFI
     [LibraryImport("ntdll.dll")]
     public static partial uint NtAlertThread(nint hThread);
 
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial nint OpenThread(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwThreadId);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial uint SuspendThread(nint hThread);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial uint ResumeThread(nint hThread);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static unsafe partial bool GetThreadContext(nint hThread, ref CONTEXT64 lpContext);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static unsafe partial bool SetThreadContext(nint hThread, ref CONTEXT64 lpContext);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool FlushInstructionCache(nint hProcess, nint lpBaseAddress, nuint dwSize);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial nint CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool Thread32First(nint hSnapshot, ref THREADENTRY32 lpte);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool Thread32Next(nint hSnapshot, ref THREADENTRY32 lpte);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetThreadContext", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetThreadContextRaw(nint hThread, nint lpContext);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "SetThreadContext", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetThreadContextRaw(nint hThread, nint lpContext);
+
     #endregion
 
 

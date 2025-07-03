@@ -291,9 +291,9 @@ public static class ManualMapper
         var currentProcess = FFI.GetCurrentProcess();
         bool currentIs64 = FFI.IsProcess64Bit(currentProcess);
         bool targetIs64 = FFI.IsProcess64Bit(hProcess);
-        
+
         Log.Debug("Architecture check: current process 64-bit={Current}, target process 64-bit={Target}", currentIs64, targetIs64);
-        
+
         if (!targetIs64)
         {
             Log.Warning("Target process is 32-bit (WOW64). Thread-hijacking only supports x64");
@@ -325,15 +325,15 @@ public static class ManualMapper
             {
                 totalThreads++;
                 threadsToDispose.Add(thread);
-                
-                if (!thread.TryGetContext(out var ctx)) 
+
+                if (!thread.TryGetContext(out var ctx))
                 {
                     Log.Verbose("Thread {Tid}: GetThreadContext failed", thread.Id);
                     continue;
                 }
                 accessibleThreads++;
-                
-                if (ctx.Rip == 0) 
+
+                if (ctx.Rip == 0)
                 {
                     Log.Verbose("Thread {Tid}: RIP is zero", thread.Id);
                     continue;
@@ -342,14 +342,14 @@ public static class ManualMapper
 
                 bool isBlocked = IsRipInSystemModule(ctx.Rip);
                 Log.Verbose("Thread {Tid}: RIP=0x{Rip:X}, blocked={Blocked}", thread.Id, ctx.Rip, isBlocked);
-                
-                if (!isBlocked) 
+
+                if (!isBlocked)
                 {
                     threadsToDispose.Remove(thread);
                     Log.Debug("Found active thread {Tid}", thread.Id);
                     return (thread, null);
                 }
-                
+
                 if (firstBlocked == null)
                 {
                     firstBlocked = thread;
@@ -358,7 +358,7 @@ public static class ManualMapper
                 }
             }
 
-            Log.Information("Thread scan: {Total} total, {Accessible} accessible, {ValidRip} valid RIP, active={HasActive}, blocked={BlockedId}", 
+            Log.Information("Thread scan: {Total} total, {Accessible} accessible, {ValidRip} valid RIP, active={HasActive}, blocked={BlockedId}",
                 totalThreads, accessibleThreads, validRipThreads, firstBlocked == null, firstBlocked?.Id ?? 0);
             return (null, firstBlocked);
         }
@@ -373,19 +373,19 @@ public static class ManualMapper
     {
         try
         {
-            if (!thread.TryGetContext(out var ctx)) 
+            if (!thread.TryGetContext(out var ctx))
                 throw new Exception($"Failed to get context for thread {thread.Id}");
 
             var (stubAddr, debugMarker) = BuildAndWriteLoaderStub(hProcess, moduleBase, nt, (nint)ctx.Rip, config);
-            
+
             ctx.Rip = (ulong)stubAddr;
             if (!thread.TrySetContext(ctx))
                 throw new Exception($"Failed to set context for thread {thread.Id}");
 
             thread.ResumeCompletely();
-            
+
             if (needsWakeup) WakeThread(thread.Id, thread.Handle);
-            
+
             Log.Debug("Hijacked thread {Tid} (RIP: 0x{Rip:X} -> 0x{Stub:X})", thread.Id, ctx.Rip, (ulong)stubAddr);
             return debugMarker;
         }
@@ -427,11 +427,17 @@ public static class ManualMapper
         public void ResumeCompletely()
         {
             uint count;
-            do { count = FFI.ResumeThread(Handle); } 
+            do { count = FFI.ResumeThread(Handle); }
             while (count > 0 && count != 0xFFFFFFFF);
         }
 
-        public void Dispose() => FFI.CloseHandleSafe(Handle);
+        public void Dispose()
+        {
+            // Ensure thread is running before closing handle
+            uint cnt;
+            do { cnt = FFI.ResumeThread(Handle); } while (cnt > 0 && cnt != 0xFFFFFFFF);
+            FFI.CloseHandleSafe(Handle);
+        }
     }
 
     private sealed class ThreadSnapshot : IDisposable
@@ -449,19 +455,19 @@ public static class ManualMapper
         public IEnumerable<ThreadInfo> EnumerateThreads()
         {
             var entry = new FFI.THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<FFI.THREADENTRY32>() };
-            
+
             if (!FFI.Thread32First(_handle, ref entry)) yield break;
 
             do
             {
                 if (entry.th32OwnerProcessID != (uint)_pid) continue;
-                
+
                 var hThread = FFI.OpenThread(FFI.THREAD_ALL_ACCESS, false, entry.th32ThreadID);
                 if (hThread == nint.Zero) continue;
 
                 var threadInfo = new ThreadInfo(entry.th32ThreadID, hThread);
                 yield return threadInfo;
-            } 
+            }
             while (FFI.Thread32Next(_handle, ref entry));
         }
 
@@ -553,14 +559,14 @@ public static class ManualMapper
             Emit(0x48, 0x89, 0x08); // mov [rax], rcx
         }
 
-        // Save volatile registers
+        // Save volatile registers (need even number for alignment)
         Emit(0x50); // push rax
         Emit(0x51); // push rcx
         Emit(0x52); // push rdx
         Emit(0x41, 0x50); // push r8
         Emit(0x53); // push rbx
 
-        // Allocate shadow space (stack should be 16-byte aligned after 5 pushes)
+        // Allocate shadow space (keep 16-byte alignment: 5 pushes = 40 bytes, so subtract 32 for shadow)
         Emit(0x48, 0x83, 0xEC, 0x20); // sub rsp, 32
 
         if (callbacksAddr != 0)
@@ -606,12 +612,12 @@ public static class ManualMapper
         }
 
         // Restore stack and registers
-        Emit(0x48, 0x83, 0xC4, 0x20);
-        Emit(0x5B);
-        Emit(0x41, 0x58);
-        Emit(0x5A);
-        Emit(0x59);
-        Emit(0x58);
+        Emit(0x48, 0x83, 0xC4, 0x20); // add rsp, 32
+        Emit(0x5B); // pop rbx
+        Emit(0x41, 0x58); // pop r8
+        Emit(0x5A); // pop rdx
+        Emit(0x59); // pop rcx
+        Emit(0x58); // pop rax
 
         if (originalRip == 0)
         {
@@ -748,7 +754,7 @@ public static class ManualMapper
 
     private static (ulong, ulong)[] InitRanges()
     {
-        string[] names = [ "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "win32u.dll" ];
+        string[] names = ["ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "win32u.dll"];
         List<(ulong, ulong)> list = [];
         foreach (var name in names)
         {

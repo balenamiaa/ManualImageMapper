@@ -30,9 +30,27 @@ public static partial class FFI
 
     #endregion
 
-    // Privilege constants
+    #region Privilege Constants
+
     public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
     public const uint TOKEN_QUERY = 0x0008;
     public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
     public const string SE_DEBUG_NAME = "SeDebugPrivilege";
+
+    #endregion
+
+    #region Thread / Toolhelp Constants
+
+    public const uint THREAD_ALL_ACCESS = 0x1FFFFF; // slightly version-dependent, this works on modern Win10+
+    public const uint CONTEXT_AMD64 = 0x00100000;
+    public const uint CONTEXT_CONTROL = CONTEXT_AMD64 | 0x00000001;
+    public const uint CONTEXT_INTEGER = CONTEXT_AMD64 | 0x00000002;
+    public const uint CONTEXT_SEGMENTS = CONTEXT_AMD64 | 0x00000004;
+    public const uint CONTEXT_FLOATING_POINT = CONTEXT_AMD64 | 0x00000008;
+    public const uint CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x00000010;
+    public const uint CONTEXT_ALL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+
+    public const uint TH32CS_SNAPTHREAD = 0x00000004;
+
+    #endregion
 }
