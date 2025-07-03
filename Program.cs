@@ -1,6 +1,8 @@
-﻿using ManualImageMapper;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using Serilog;
+using ManualImageMapper;
+
+using static ManualImageMapper.WinApi.Methods;
 
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
@@ -53,7 +55,7 @@ if (int.TryParse(target, out var parsedPid))
     }
 }
 
-pid ??= GetPiD.FromProcessName(target);
+pid ??= GetProcessIdFromProcessName(target);
 
 if (pid is not int validPid)
 {

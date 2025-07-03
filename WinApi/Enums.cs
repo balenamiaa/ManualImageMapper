@@ -1,8 +1,6 @@
-using System.Runtime.InteropServices;
+namespace ManualImageMapper.WinApi;
 
-namespace ManualImageMapper;
-
-public static partial class FFI
+public static partial class Enums
 {
 
     public enum MachineType : ushort
@@ -71,4 +69,5 @@ public static partial class FFI
         DELAY_IMPORT = 13,
         COM_DESCRIPTOR = 14
     }
+
 }

@@ -1,19 +1,22 @@
 using System.Runtime.InteropServices;
-using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using Serilog;
+using ManualImageMapper.StringMatching;
 
-namespace ManualImageMapper;
+using static ManualImageMapper.WinApi.Enums;
+using static ManualImageMapper.WinApi.Structs;
+using static ManualImageMapper.WinApi.Constants;
+
+namespace ManualImageMapper.WinApi;
 
 /// <summary>
 /// Foreign Function Interface providing Win32 API wrappers and PE manipulation utilities.
 /// </summary>
-public static partial class FFI
+public static partial class Methods
 {
-    private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(FFI));
+    private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(Methods));
 
-    #region Native Methods
-
+    #region Low Level Native Methods
     [LibraryImport("kernel32.dll", SetLastError = true)]
     public static partial nint OpenProcess(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, int dwProcessId);
 
@@ -130,11 +133,9 @@ public static partial class FFI
     [LibraryImport("kernel32.dll", EntryPoint = "SetThreadContext", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool SetThreadContextRaw(nint hThread, nint lpContext);
-
     #endregion
 
     #region Higher Level Methods
-
     /// <summary>
     /// Opens the target process with PROCESS_ALL_ACCESS. Throws on failure.
     /// </summary>
@@ -468,7 +469,23 @@ public static partial class FFI
         }
     }
 
+    /// <summary>
+    /// Does fuzzy matching on the process names that contain processName to find the process identifier. Chooses the process with the most similar name.
+    /// </summary>
+    /// <param name="processName">The name of the process to find.</param>
+    /// <returns>The process identifier if found, otherwise null.</returns>
+    public static int? GetProcessIdFromProcessName(string processName)
+    {
+        var processes = Process.GetProcesses();
+
+        var bestMatch = processes
+            .Where(p => p.ProcessName.Contains(processName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => LevenshteinDistance.Calculate(p.ProcessName, processName))
+            .FirstOrDefault();
+
+        return bestMatch?.Id;
+    }
+
     #endregion
+
 }
-
-

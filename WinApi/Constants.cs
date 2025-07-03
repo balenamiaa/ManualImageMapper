@@ -1,11 +1,9 @@
-using System.Runtime.InteropServices;
+namespace ManualImageMapper.WinApi;
 
-namespace ManualImageMapper;
-
-public static partial class FFI
+public static partial class Constants
 {
-    #region PE Constants
 
+    #region PE Constants
     public const ushort IMAGE_DOS_SIGNATURE = 0x5A4D; // "MZ"
     public const uint IMAGE_NT_SIGNATURE = 0x00004550; // "PE\0\0"
 
@@ -27,20 +25,16 @@ public static partial class FFI
     public const uint PAGE_EXECUTE_WRITECOPY = 0x80;
 
     public const uint INFINITE = 0xFFFFFFFF;
-
     #endregion
 
     #region Privilege Constants
-
     public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
     public const uint TOKEN_QUERY = 0x0008;
     public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
     public const string SE_DEBUG_NAME = "SeDebugPrivilege";
-
     #endregion
 
     #region Thread / Toolhelp Constants
-
     public const uint THREAD_ALL_ACCESS = 0x1FFFFF; // slightly version-dependent, this works on modern Win10+
     public const uint CONTEXT_AMD64 = 0x00100000;
     public const uint CONTEXT_CONTROL = CONTEXT_AMD64 | 0x00000001;
@@ -51,6 +45,6 @@ public static partial class FFI
     public const uint CONTEXT_ALL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
 
     public const uint TH32CS_SNAPTHREAD = 0x00000004;
-
     #endregion
+
 }

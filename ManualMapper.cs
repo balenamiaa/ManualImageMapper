@@ -1,8 +1,10 @@
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Serilog;
+
+using static ManualImageMapper.WinApi.Methods;
+using static ManualImageMapper.WinApi.Enums;
+using static ManualImageMapper.WinApi.Structs;
+using static ManualImageMapper.WinApi.Constants;
 
 namespace ManualImageMapper;
 
@@ -27,21 +29,21 @@ public static class ManualMapper
     /// </summary>
     public static void Inject(byte[] dllBytes, int pid, InjectionMode mode)
     {
-        var nt = FFI.GetNtHeaders(dllBytes);
-        var sections = FFI.GetSectionHeaders(dllBytes);
+        var nt = GetNtHeaders(dllBytes);
+        var sections = GetSectionHeaders(dllBytes);
 
         Log.Information("Opening target process {Pid}", pid);
-        var hProcess = FFI.OpenTargetProcess(pid);
+        var hProcess = OpenTargetProcess(pid);
         try
         {
             Log.Debug("Allocating {Size} bytes in target", nt.OptionalHeader.SizeOfImage);
-            var remoteBase = FFI.AllocateMemory(hProcess, nt.OptionalHeader.SizeOfImage);
+            var remoteBase = AllocateMemory(hProcess, nt.OptionalHeader.SizeOfImage);
 
             Log.Debug("Copying headers ({HeaderSize} bytes)", nt.OptionalHeader.SizeOfHeaders);
-            FFI.WriteMemory(hProcess, remoteBase, dllBytes.AsSpan(0, (int)nt.OptionalHeader.SizeOfHeaders).ToArray());
+            WriteMemory(hProcess, remoteBase, dllBytes.AsSpan(0, (int)nt.OptionalHeader.SizeOfHeaders).ToArray());
 
             Log.Debug("Mapping {SectionCount} sections", sections.Count);
-            FFI.MapSections(hProcess, remoteBase, dllBytes, sections);
+            MapSections(hProcess, remoteBase, dllBytes, sections);
 
             Log.Debug("Applying relocations");
             ApplyRelocations(hProcess, remoteBase, dllBytes, nt, sections);
@@ -50,10 +52,10 @@ public static class ManualMapper
             ResolveImports(hProcess, remoteBase, dllBytes, nt, sections, pid, mode);
 
             Log.Debug("Setting final section protections");
-            FFI.SetSectionProtections(hProcess, remoteBase, sections);
+            SetSectionProtections(hProcess, remoteBase, sections);
 
             Log.Debug("Flushing instruction cache & erasing headers");
-            FFI.FlushInstructionCache(hProcess, remoteBase, nt.OptionalHeader.SizeOfImage);
+            FlushInstructionCache(hProcess, remoteBase, nt.OptionalHeader.SizeOfImage);
             EraseHeaders(hProcess, remoteBase, nt.OptionalHeader.SizeOfHeaders);
 
             switch (mode)
@@ -74,7 +76,7 @@ public static class ManualMapper
                         Thread.Sleep(hijack.DebugMarkerCheckDelay);
                         try
                         {
-                            var markerValue = FFI.ReadMemory(hProcess, debugMarker, 8);
+                            var markerValue = ReadMemory(hProcess, debugMarker, 8);
                             var value = BitConverter.ToUInt64(markerValue);
                             Log.Debug("Debug marker result: 0x{Value:X} (entry=0x1111111111111111, preDllMain=0x2222222222222222, postDllMain=0x1337DEADBEEFCAFE)", value);
                         }
@@ -93,12 +95,12 @@ public static class ManualMapper
                     var wrapperStub = CreateDllMainWrapper(hProcess, (ulong)dllMain, (ulong)remoteBase);
                     Log.Debug("Wrapper stub at 0x{Wrapper:X}", (ulong)wrapperStub);
 
-                    var hThread = FFI.CreateRemoteThreadAndWait(hProcess, wrapperStub, nint.Zero, wait: false);
+                    var hThread = CreateRemoteThreadAndWait(hProcess, wrapperStub, nint.Zero, wait: false);
                     Log.Debug("Created thread 0x{Thread:X} for wrapper", (ulong)hThread);
                     if (hThread != nint.Zero)
                     {
-                        FFI.WaitForSingleObject(hThread, remoteThread.TimeoutMs);
-                        FFI.CloseHandleSafe(hThread);
+                        WaitForSingleObject(hThread, remoteThread.TimeoutMs);
+                        CloseHandleSafe(hThread);
                     }
                     break;
 
@@ -112,16 +114,16 @@ public static class ManualMapper
         finally
         {
             Log.Information("Finished injecting – closing handle");
-            FFI.CloseHandleSafe(hProcess);
+            CloseHandleSafe(hProcess);
         }
     }
 
     /// <summary>
     /// Applies PE relocations to patch absolute addresses for the new base address.
     /// </summary>
-    private static void ApplyRelocations(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
+    private static void ApplyRelocations(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, IMAGE_NT_HEADERS64 nt, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
     {
-        var relocDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.BASERELOC];
+        var relocDir = nt.OptionalHeader.DataDirectory[(int)ImageDirectoryEntry.BASERELOC];
         if (relocDir.Size == 0) return;
 
         var delta = remoteBase.ToInt64() - (long)nt.OptionalHeader.ImageBase;
@@ -135,10 +137,10 @@ public static class ManualMapper
         while (processed < relocDir.Size)
         {
             int blockOffset = relocBaseOffset + processed;
-            var reloc = FFI.BytesToStructure<FFI.IMAGE_BASE_RELOCATION>(localArr, blockOffset);
-            processed += Marshal.SizeOf<FFI.IMAGE_BASE_RELOCATION>();
+            var reloc = BytesToStructure<IMAGE_BASE_RELOCATION>(localArr, blockOffset);
+            processed += Marshal.SizeOf<IMAGE_BASE_RELOCATION>();
 
-            int entryCount = ((int)reloc.SizeOfBlock - Marshal.SizeOf<FFI.IMAGE_BASE_RELOCATION>()) / 2;
+            int entryCount = ((int)reloc.SizeOfBlock - Marshal.SizeOf<IMAGE_BASE_RELOCATION>()) / 2;
             Log.Debug("Reloc block VA 0x{BlockVa:X} entries {Count}", reloc.VirtualAddress, entryCount);
 
             for (int i = 0; i < entryCount; i++)
@@ -147,13 +149,13 @@ public static class ManualMapper
                 int type = entryVal >> 12;
                 int offset = entryVal & 0xFFF;
 
-                if (type == FFI.IMAGE_REL_BASED_DIR64)
+                if (type == IMAGE_REL_BASED_DIR64)
                 {
                     var patchAddrRemote = remoteBase + (int)reloc.VirtualAddress + offset;
-                    var origBytes = FFI.ReadMemory(hProcess, patchAddrRemote, 8);
+                    var origBytes = ReadMemory(hProcess, patchAddrRemote, 8);
                     ulong origPtr = BitConverter.ToUInt64(origBytes);
                     ulong newPtr = origPtr + (ulong)delta;
-                    FFI.WriteMemory(hProcess, patchAddrRemote, BitConverter.GetBytes(newPtr));
+                    WriteMemory(hProcess, patchAddrRemote, BitConverter.GetBytes(newPtr));
                     Log.Verbose("Patched 0x{PatchAddr:X}: {OrigPtr:X} -> {NewPtr:X}", (ulong)patchAddrRemote, origPtr, newPtr);
                 }
             }
@@ -164,12 +166,12 @@ public static class ManualMapper
     /// <summary>
     /// Resolves DLL imports by writing function pointers into the Import Address Table.
     /// </summary>
-    private static void ResolveImports(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections, int pid, InjectionMode mode)
+    private static void ResolveImports(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, IMAGE_NT_HEADERS64 nt, IReadOnlyList<IMAGE_SECTION_HEADER> sections, int pid, InjectionMode mode)
     {
-        var importDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.IMPORT];
+        var importDir = nt.OptionalHeader.DataDirectory[(int)ImageDirectoryEntry.IMPORT];
         if (importDir.Size == 0) return;
 
-        int descriptorSize = Marshal.SizeOf<FFI.IMAGE_IMPORT_DESCRIPTOR>();
+        int descriptorSize = Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>();
         int index = 0;
         var localArr = localImage.ToArray();
 
@@ -178,13 +180,13 @@ public static class ManualMapper
         while (true)
         {
             int descOffset = RvaToOffset(importDir.VirtualAddress + (uint)(index * descriptorSize), sections);
-            var desc = FFI.BytesToStructure<FFI.IMAGE_IMPORT_DESCRIPTOR>(localArr, descOffset);
+            var desc = BytesToStructure<IMAGE_IMPORT_DESCRIPTOR>(localArr, descOffset);
             if (desc.Name == 0) break;
 
             string dllName = ReadAnsiString(localArr, desc.Name, sections);
             Log.Debug("Import descriptor {Dll}", dllName);
 
-            var hModuleRemote = FFI.GetModuleHandle(dllName);
+            var hModuleRemote = GetModuleHandle(dllName);
             if (hModuleRemote == nint.Zero)
             {
                 switch (mode)
@@ -197,28 +199,28 @@ public static class ManualMapper
                     case InjectionMode.CreateRemoteThread:
                         Log.Debug("{Dll} not loaded – calling LdrLoadDll with remote thread", dllName);
                         var wideBytes = System.Text.Encoding.Unicode.GetBytes(dllName + "\0");
-                        var remoteStr = FFI.AllocateMemory(hProcess, (uint)wideBytes.Length, FFI.PAGE_READWRITE);
-                        FFI.WriteMemory(hProcess, remoteStr, wideBytes);
+                        var remoteStr = AllocateMemory(hProcess, (uint)wideBytes.Length, PAGE_READWRITE);
+                        WriteMemory(hProcess, remoteStr, wideBytes);
 
                         ushort len = (ushort)(wideBytes.Length - 2);
                         var unicodeBuf = new byte[16];
                         BitConverter.GetBytes(len).CopyTo(unicodeBuf, 0);
                         BitConverter.GetBytes((ushort)wideBytes.Length).CopyTo(unicodeBuf, 2);
                         BitConverter.GetBytes((ulong)remoteStr).CopyTo(unicodeBuf, 8);
-                        var remoteUnicode = FFI.AllocateMemory(hProcess, 16, FFI.PAGE_READWRITE);
-                        FFI.WriteMemory(hProcess, remoteUnicode, unicodeBuf);
+                        var remoteUnicode = AllocateMemory(hProcess, 16, PAGE_READWRITE);
+                        WriteMemory(hProcess, remoteUnicode, unicodeBuf);
 
-                        var remoteHandle = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
-                        FFI.WriteMemory(hProcess, remoteHandle, new byte[8]);
+                        var remoteHandle = AllocateMemory(hProcess, 8, PAGE_READWRITE);
+                        WriteMemory(hProcess, remoteHandle, new byte[8]);
 
-                        var ldrLoadDll = FFI.GetProcAddress(FFI.GetModuleHandle("ntdll.dll"), "LdrLoadDll");
+                        var ldrLoadDll = GetProcAddress(GetModuleHandle("ntdll.dll"), "LdrLoadDll");
                         var wrapper = CreateDllLoadWrapper(hProcess, (ulong)ldrLoadDll, (ulong)remoteUnicode, (ulong)remoteHandle);
-                        FFI.CreateRemoteThreadAndWait(hProcess, wrapper, nint.Zero, wait: true);
-                        FFI.FreeMemory(hProcess, wrapper);
+                        CreateRemoteThreadAndWait(hProcess, wrapper, nint.Zero, wait: true);
+                        FreeMemory(hProcess, wrapper);
 
-                        FFI.FreeMemory(hProcess, remoteStr);
-                        FFI.FreeMemory(hProcess, remoteUnicode);
-                        FFI.FreeMemory(hProcess, remoteHandle);
+                        FreeMemory(hProcess, remoteStr);
+                        FreeMemory(hProcess, remoteUnicode);
+                        FreeMemory(hProcess, remoteHandle);
                         break;
                     default:
                         throw new ArgumentException($"Unsupported injection mode: {mode.GetType().Name}");
@@ -238,19 +240,19 @@ public static class ManualMapper
                 if ((importRef & 0x8000000000000000) != 0)
                 {
                     ushort ordinal = (ushort)(importRef & 0xFFFF);
-                    funcPtr = FFI.GetProcAddress(FFI.GetModuleHandle(dllName), ordinal);
+                    funcPtr = GetProcAddress(GetModuleHandle(dllName), ordinal);
                     identifier = $"ordinal #{ordinal}";
                 }
                 else
                 {
                     uint nameRva = (uint)(importRef & 0x7FFFFFFF_FFFFFFFF);
                     string funcName = ReadAnsiString(localArr, nameRva + 2, sections);
-                    funcPtr = FFI.GetProcAddress(FFI.GetModuleHandle(dllName), funcName);
+                    funcPtr = GetProcAddress(GetModuleHandle(dllName), funcName);
                     identifier = funcName;
                 }
 
                 var iatEntryRemote = remoteBase + (int)desc.FirstThunk + thunkIdx * sizeof(ulong);
-                FFI.WriteMemory(hProcess, iatEntryRemote, BitConverter.GetBytes((ulong)funcPtr));
+                WriteMemory(hProcess, iatEntryRemote, BitConverter.GetBytes((ulong)funcPtr));
                 Log.Verbose("Resolved {Dll}!{Ident} -> 0x{Ptr:X}", dllName, identifier, (ulong)funcPtr);
                 thunkIdx++;
             }
@@ -261,7 +263,7 @@ public static class ManualMapper
     /// <summary>
     /// Reads a null-terminated ANSI string from the PE image at the specified RVA.
     /// </summary>
-    private static string ReadAnsiString(byte[] image, uint rva, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
+    private static string ReadAnsiString(byte[] image, uint rva, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
     {
         int offset = RvaToOffset(rva, sections);
         int len = 0;
@@ -272,7 +274,7 @@ public static class ManualMapper
     /// <summary>
     /// Converts a Relative Virtual Address to file offset using section headers.
     /// </summary>
-    private static int RvaToOffset(uint rva, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
+    private static int RvaToOffset(uint rva, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
     {
         foreach (var section in sections)
         {
@@ -292,19 +294,19 @@ public static class ManualMapper
     private static void EraseHeaders(nint hProcess, nint remoteBase, uint headerSize)
     {
         var zeros = new byte[headerSize];
-        FFI.ProtectMemory(hProcess, remoteBase, headerSize, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, remoteBase, zeros);
+        ProtectMemory(hProcess, remoteBase, headerSize, PAGE_READWRITE);
+        WriteMemory(hProcess, remoteBase, zeros);
     }
 
     /// <summary>
     /// Hijacks the first available thread to execute the loader stub.
     /// Prefers non-blocked threads but will wake blocked ones if needed.
     /// </summary>
-    private static nint HijackFirstThread(int pid, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config)
+    private static nint HijackFirstThread(int pid, nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config)
     {
-        var currentProcess = FFI.GetCurrentProcess();
-        bool currentIs64 = FFI.IsProcess64Bit(currentProcess);
-        bool targetIs64 = FFI.IsProcess64Bit(hProcess);
+        var currentProcess = GetCurrentProcess();
+        bool currentIs64 = IsProcess64Bit(currentProcess);
+        bool targetIs64 = IsProcess64Bit(hProcess);
 
         Log.Debug("Architecture check: current process 64-bit={Current}, target process 64-bit={Target}", currentIs64, targetIs64);
 
@@ -314,7 +316,7 @@ public static class ManualMapper
             return nint.Zero;
         }
 
-        if (config.EnableDebugPrivilege) FFI.EnableSeDebugPrivilege();
+        if (config.EnableDebugPrivilege) EnableSeDebugPrivilege();
 
         using var snap = new ThreadSnapshot(pid);
         var (activeThread, blockedThread) = FindCandidateThreads(snap);
@@ -383,7 +385,7 @@ public static class ManualMapper
         }
     }
 
-    private static nint HijackThread(ThreadInfo thread, nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config, bool needsWakeup)
+    private static nint HijackThread(ThreadInfo thread, nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt, InjectionMode.ThreadHijacking config, bool needsWakeup)
     {
         try
         {
@@ -411,45 +413,45 @@ public static class ManualMapper
 
     private readonly record struct ThreadInfo(uint Id, nint Handle)
     {
-        public bool TryGetContext(out FFI.CONTEXT64 ctx)
+        public bool TryGetContext(out CONTEXT64 ctx)
         {
             ctx = default;
-            var suspend = FFI.SuspendThread(Handle);
+            var suspend = SuspendThread(Handle);
             if (suspend == 0xFFFFFFFF)
             {
                 Log.Verbose("Thread {Tid}: SuspendThread failed (err {Err})", Id, Marshal.GetLastWin32Error());
                 return false;
             }
 
-            if (!FFI.TryGetThreadContext(Handle, out ctx))
+            if (!TryGetThreadContext(Handle, out ctx))
             {
-                FFI.ResumeThread(Handle);
+                ResumeThread(Handle);
                 return false;
             }
 
             return true;
         }
 
-        public bool TrySetContext(FFI.CONTEXT64 ctx)
+        public bool TrySetContext(CONTEXT64 ctx)
         {
-            bool success = FFI.TrySetThreadContext(Handle, ctx);
+            bool success = TrySetThreadContext(Handle, ctx);
             if (!success)
-                FFI.ResumeThread(Handle);
+                ResumeThread(Handle);
             return success;
         }
 
         public void ResumeCompletely()
         {
             uint count;
-            do { count = FFI.ResumeThread(Handle); }
+            do { count = ResumeThread(Handle); }
             while (count > 0 && count != 0xFFFFFFFF);
         }
 
         public void Dispose()
         {
             uint cnt;
-            do { cnt = FFI.ResumeThread(Handle); } while (cnt > 0 && cnt != 0xFFFFFFFF);
-            FFI.CloseHandleSafe(Handle);
+            do { cnt = ResumeThread(Handle); } while (cnt > 0 && cnt != 0xFFFFFFFF);
+            CloseHandleSafe(Handle);
         }
     }
 
@@ -461,52 +463,52 @@ public static class ManualMapper
         public ThreadSnapshot(int pid)
         {
             _pid = pid;
-            _handle = FFI.CreateToolhelp32Snapshot(FFI.TH32CS_SNAPTHREAD, 0);
+            _handle = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if (_handle == nint.Zero) throw new System.ComponentModel.Win32Exception();
         }
 
         public IEnumerable<ThreadInfo> EnumerateThreads()
         {
-            var entry = new FFI.THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<FFI.THREADENTRY32>() };
+            var entry = new THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<THREADENTRY32>() };
 
-            if (!FFI.Thread32First(_handle, ref entry)) yield break;
+            if (!Thread32First(_handle, ref entry)) yield break;
 
             do
             {
                 if (entry.th32OwnerProcessID != (uint)_pid) continue;
 
-                var hThread = FFI.OpenThread(FFI.THREAD_ALL_ACCESS, false, entry.th32ThreadID);
+                var hThread = OpenThread(THREAD_ALL_ACCESS, false, entry.th32ThreadID);
                 if (hThread == nint.Zero) continue;
 
                 var threadInfo = new ThreadInfo(entry.th32ThreadID, hThread);
                 yield return threadInfo;
             }
-            while (FFI.Thread32Next(_handle, ref entry));
+            while (Thread32Next(_handle, ref entry));
         }
 
-        public void Dispose() => FFI.CloseHandleSafe(_handle);
+        public void Dispose() => CloseHandleSafe(_handle);
     }
 
     /// <summary>
     /// Creates and writes a loader stub that calls TLS callbacks and DllMain, then returns to original execution.
     /// </summary>
-    private static (nint stubAddress, nint debugMarkerAddress) BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, FFI.IMAGE_NT_HEADERS64 nt, nint originalRip, InjectionMode.ThreadHijacking config)
+    private static (nint stubAddress, nint debugMarkerAddress) BuildAndWriteLoaderStub(nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt, nint originalRip, InjectionMode.ThreadHijacking config)
     {
         var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
 
-        var tlsDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.TLS];
+        var tlsDir = nt.OptionalHeader.DataDirectory[(int)ImageDirectoryEntry.TLS];
         List<ulong> callbacks = [];
         if (tlsDir.Size != 0)
         {
-            var tlsRemote = FFI.ReadMemory(hProcess, moduleBase + (int)tlsDir.VirtualAddress, Marshal.SizeOf<FFI.IMAGE_TLS_DIRECTORY64>());
-            var tlsStruct = FFI.BytesToStructure<FFI.IMAGE_TLS_DIRECTORY64>(tlsRemote, 0);
+            var tlsRemote = ReadMemory(hProcess, moduleBase + (int)tlsDir.VirtualAddress, Marshal.SizeOf<IMAGE_TLS_DIRECTORY64>());
+            var tlsStruct = BytesToStructure<IMAGE_TLS_DIRECTORY64>(tlsRemote, 0);
             if (tlsStruct.AddressOfCallBacks != 0)
             {
                 Log.Debug("Collecting TLS callbacks");
                 ulong cbPtr = tlsStruct.AddressOfCallBacks;
                 while (true)
                 {
-                    var buf = FFI.ReadMemory(hProcess, (nint)cbPtr, 8);
+                    var buf = ReadMemory(hProcess, (nint)cbPtr, 8);
                     ulong cb = BitConverter.ToUInt64(buf);
                     if (cb == 0) break;
                     callbacks.Add(cb);
@@ -519,14 +521,14 @@ public static class ManualMapper
         var arrBytes = new List<byte>();
         foreach (var c in callbacks) arrBytes.AddRange(BitConverter.GetBytes(c));
         arrBytes.AddRange(BitConverter.GetBytes((ulong)0));
-        var callbacksRemote = FFI.AllocateMemory(hProcess, (uint)arrBytes.Count, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, callbacksRemote, [.. arrBytes]);
+        var callbacksRemote = AllocateMemory(hProcess, (uint)arrBytes.Count, PAGE_READWRITE);
+        WriteMemory(hProcess, callbacksRemote, [.. arrBytes]);
 
         nint debugMarker = nint.Zero;
         if (config.EnableDebugMarker)
         {
-            debugMarker = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
-            FFI.WriteMemory(hProcess, debugMarker, BitConverter.GetBytes(0xDEADBEEFCAFEBABEUL));
+            debugMarker = AllocateMemory(hProcess, 8, PAGE_READWRITE);
+            WriteMemory(hProcess, debugMarker, BitConverter.GetBytes(0xDEADBEEFCAFEBABEUL));
             Log.Debug("Debug marker at 0x{Marker:X} (should change to 0x1337DEADBEEFCAFE after DllMain)", (ulong)debugMarker);
         }
 
@@ -538,10 +540,10 @@ public static class ManualMapper
             Log.Information("Generated stub bytes: {StubHex}", Convert.ToHexString(stub));
         }
 
-        var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
-        FFI.WriteMemory(hProcess, remote, stub);
-        FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
-        FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
+        var remote = AllocateMemory(hProcess, (uint)stub.Length, PAGE_EXECUTE_READWRITE);
+        WriteMemory(hProcess, remote, stub);
+        ProtectMemory(hProcess, remote, (uint)stub.Length, PAGE_EXECUTE_READ);
+        FlushInstructionCache(hProcess, remote, (uint)stub.Length);
 
         return (remote, debugMarker);
     }
@@ -646,7 +648,7 @@ public static class ManualMapper
     /// </summary>
     private static void UnlinkFromPEB(nint hProcess, nint moduleBase)
     {
-        var status = FFI.NtQueryInformationProcess(hProcess, FFI.PROCESSINFOCLASS.ProcessBasicInformation, out var pbi, Marshal.SizeOf<FFI.PROCESS_BASIC_INFORMATION>(), out _);
+        var status = NtQueryInformationProcess(hProcess, PROCESSINFOCLASS.ProcessBasicInformation, out var pbi, Marshal.SizeOf<PROCESS_BASIC_INFORMATION>(), out _);
         if (status != 0) return;
 
         nint peb = pbi.PebBaseAddress;
@@ -658,9 +660,9 @@ public static class ManualMapper
         const int entryOffsetInInit = 0x20;
 
         byte[] buf8 = new byte[8];
-        FFI.ReadProcessMemory(hProcess, peb + offsetLdr, buf8, 8, out _);
+        ReadProcessMemory(hProcess, peb + offsetLdr, buf8, 8, out _);
         nint ldr = (nint)BitConverter.ToInt64(buf8);
-        FFI.ReadProcessMemory(hProcess, ldr + offsetInLoadOrder, buf8, 8, out _);
+        ReadProcessMemory(hProcess, ldr + offsetInLoadOrder, buf8, 8, out _);
         nint listHead = (nint)BitConverter.ToInt64(buf8);
         nint current = listHead;
         int safety = 0;
@@ -668,7 +670,7 @@ public static class ManualMapper
         while (safety++ < 256)
         {
             byte[] dllBuf = new byte[8];
-            FFI.ReadProcessMemory(hProcess, current + entryOffsetDllBase, dllBuf, 8, out _);
+            ReadProcessMemory(hProcess, current + entryOffsetDllBase, dllBuf, 8, out _);
             nint dllBaseRead = (nint)BitConverter.ToInt64(dllBuf);
             if (dllBaseRead == moduleBase)
             {
@@ -676,12 +678,12 @@ public static class ManualMapper
                 {
                     byte[] flinkBuf = new byte[8];
                     byte[] blinkBuf = new byte[8];
-                    FFI.ReadProcessMemory(hProcess, current + offset, flinkBuf, 8, out _);
-                    FFI.ReadProcessMemory(hProcess, current + offset + 8, blinkBuf, 8, out _);
+                    ReadProcessMemory(hProcess, current + offset, flinkBuf, 8, out _);
+                    ReadProcessMemory(hProcess, current + offset + 8, blinkBuf, 8, out _);
                     nint flink = (nint)BitConverter.ToInt64(flinkBuf);
                     nint blink = (nint)BitConverter.ToInt64(blinkBuf);
-                    FFI.WriteMemory(hProcess, blink, BitConverter.GetBytes((ulong)flink));
-                    FFI.WriteMemory(hProcess, flink + 8, BitConverter.GetBytes((ulong)blink));
+                    WriteMemory(hProcess, blink, BitConverter.GetBytes((ulong)flink));
+                    WriteMemory(hProcess, flink + 8, BitConverter.GetBytes((ulong)blink));
                 }
 
                 Unlink(entryOffsetInLoad);
@@ -690,7 +692,7 @@ public static class ManualMapper
                 break;
             }
 
-            FFI.ReadProcessMemory(hProcess, current, buf8, 8, out _);
+            ReadProcessMemory(hProcess, current, buf8, 8, out _);
             current = (nint)BitConverter.ToInt64(buf8);
             if (current == listHead || current == nint.Zero) break;
         }
@@ -727,10 +729,10 @@ public static class ManualMapper
         Emit(0xC3);
 
         var stub = b.ToArray();
-        var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
-        FFI.WriteMemory(hProcess, remote, stub);
-        FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
-        FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
+        var remote = AllocateMemory(hProcess, (uint)stub.Length, PAGE_EXECUTE_READWRITE);
+        WriteMemory(hProcess, remote, stub);
+        ProtectMemory(hProcess, remote, (uint)stub.Length, PAGE_EXECUTE_READ);
+        FlushInstructionCache(hProcess, remote, (uint)stub.Length);
         return remote;
     }
 
@@ -754,7 +756,7 @@ public static class ManualMapper
         List<(ulong, ulong)> list = [];
         foreach (var name in names)
         {
-            var h = FFI.GetModuleHandle(name);
+            var h = GetModuleHandle(name);
             if (h != nint.Zero)
             {
                 list.Add(((ulong)h, 0x400000UL));
@@ -769,8 +771,8 @@ public static class ManualMapper
     private static void WakeThread(uint tid, nint hThread)
     {
         const uint WM_NULL = 0x0000;
-        FFI.PostThreadMessage(tid, WM_NULL, 0, nint.Zero);
-        FFI.NtAlertThread(hThread);
+        PostThreadMessage(tid, WM_NULL, 0, nint.Zero);
+        NtAlertThread(hThread);
     }
 
     private static nint CreateDllLoadWrapper(nint hProcess, ulong ldrLoadDllAddr, ulong remoteUnicodeAddr, ulong remoteHandleAddr)
@@ -800,31 +802,31 @@ public static class ManualMapper
         Emit(0xC3);
 
         var stub = b.ToArray();
-        var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
-        FFI.WriteMemory(hProcess, remote, stub);
-        FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
-        FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
+        var remote = AllocateMemory(hProcess, (uint)stub.Length, PAGE_EXECUTE_READWRITE);
+        WriteMemory(hProcess, remote, stub);
+        ProtectMemory(hProcess, remote, (uint)stub.Length, PAGE_EXECUTE_READ);
+        FlushInstructionCache(hProcess, remote, (uint)stub.Length);
         return remote;
     }
 
     private static void LoadLibraryViaHijack(nint hProcess, int pid, string dllName)
     {
         var wideBytes = System.Text.Encoding.Unicode.GetBytes(dllName + "\0");
-        var remoteStr = FFI.AllocateMemory(hProcess, (uint)wideBytes.Length, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, remoteStr, wideBytes);
+        var remoteStr = AllocateMemory(hProcess, (uint)wideBytes.Length, PAGE_READWRITE);
+        WriteMemory(hProcess, remoteStr, wideBytes);
 
         ushort len = (ushort)(wideBytes.Length - 2);
         var unicodeBuf = new byte[16];
         BitConverter.GetBytes(len).CopyTo(unicodeBuf, 0);
         BitConverter.GetBytes((ushort)wideBytes.Length).CopyTo(unicodeBuf, 2);
         BitConverter.GetBytes((ulong)remoteStr).CopyTo(unicodeBuf, 8);
-        var remoteUnicode = FFI.AllocateMemory(hProcess, 16, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, remoteUnicode, unicodeBuf);
+        var remoteUnicode = AllocateMemory(hProcess, 16, PAGE_READWRITE);
+        WriteMemory(hProcess, remoteUnicode, unicodeBuf);
 
-        var remoteHandle = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
-        FFI.WriteMemory(hProcess, remoteHandle, new byte[8]);
+        var remoteHandle = AllocateMemory(hProcess, 8, PAGE_READWRITE);
+        WriteMemory(hProcess, remoteHandle, new byte[8]);
 
-        var ldrLoadDll = FFI.GetProcAddress(FFI.GetModuleHandle("ntdll.dll"), "LdrLoadDll");
+        var ldrLoadDll = GetProcAddress(GetModuleHandle("ntdll.dll"), "LdrLoadDll");
 
         using var snap = new ThreadSnapshot(pid);
         var (active, blocked) = FindCandidateThreads(snap);
@@ -835,10 +837,10 @@ public static class ManualMapper
         {
             if (!thread.TryGetContext(out var ctx)) throw new Exception("Failed to get context");
             var stub = BuildLdrLoadDllCallStub((ulong)ldrLoadDll, (ulong)remoteUnicode, (ulong)remoteHandle, ctx.Rip);
-            var remoteStub = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
-            FFI.WriteMemory(hProcess, remoteStub, stub);
-            FFI.ProtectMemory(hProcess, remoteStub, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
-            FFI.FlushInstructionCache(hProcess, remoteStub, (uint)stub.Length);
+            var remoteStub = AllocateMemory(hProcess, (uint)stub.Length, PAGE_EXECUTE_READWRITE);
+            WriteMemory(hProcess, remoteStub, stub);
+            ProtectMemory(hProcess, remoteStub, (uint)stub.Length, PAGE_EXECUTE_READ);
+            FlushInstructionCache(hProcess, remoteStub, (uint)stub.Length);
             ctx.Rip = (ulong)remoteStub;
             if (!thread.TrySetContext(ctx)) throw new Exception("Failed to set context");
             thread.ResumeCompletely();

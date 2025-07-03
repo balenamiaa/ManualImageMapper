@@ -1,9 +1,11 @@
 using System.Runtime.InteropServices;
+using static ManualImageMapper.WinApi.Enums;
 
-namespace ManualImageMapper;
+namespace ManualImageMapper.WinApi;
 
-public static partial class FFI
+public static partial class Structs
 {
+
     #region Additional PE Structures
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
@@ -322,5 +324,7 @@ public static partial class FFI
         public ulong Rip;
         // The full CONTEXT has many more fields (XMM registers, etc.). They are omitted for brevity; Windows ignores absent fields if ContextFlags doesn't reference them.
     }
+
     #endregion
+
 }
