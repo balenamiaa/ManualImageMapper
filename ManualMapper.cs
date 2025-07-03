@@ -47,7 +47,7 @@ public static class ManualMapper
             ApplyRelocations(hProcess, remoteBase, dllBytes, nt, sections);
 
             Log.Debug("Resolving imports");
-            ResolveImports(hProcess, remoteBase, dllBytes, nt, sections);
+            ResolveImports(hProcess, remoteBase, dllBytes, nt, sections, pid, mode);
 
             Log.Debug("Setting final section protections");
             FFI.SetSectionProtections(hProcess, remoteBase, sections);
@@ -63,9 +63,9 @@ public static class ManualMapper
                         hijack.EnableDebugPrivilege, hijack.EnableDebugMarker, hijack.LogGeneratedStub);
                     var debugMarker = HijackFirstThread(pid, hProcess, remoteBase, nt, hijack);
 
-                    if (debugMarker == nint.Zero)
+                    if (hijack.EnableDebugMarker && debugMarker == nint.Zero)
                     {
-                        Log.Warning("Failed to hijack any thread. Stopping injection.");
+                        Log.Warning("Failed to hijack any thread (debug marker missing). Stopping injection.");
                         return;
                     }
 
@@ -164,7 +164,7 @@ public static class ManualMapper
     /// <summary>
     /// Resolves DLL imports by writing function pointers into the Import Address Table.
     /// </summary>
-    private static void ResolveImports(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections)
+    private static void ResolveImports(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, FFI.IMAGE_NT_HEADERS64 nt, IReadOnlyList<FFI.IMAGE_SECTION_HEADER> sections, int pid, InjectionMode mode)
     {
         var importDir = nt.OptionalHeader.DataDirectory[(int)FFI.ImageDirectoryEntry.IMPORT];
         if (importDir.Size == 0) return;
@@ -187,14 +187,42 @@ public static class ManualMapper
             var hModuleRemote = FFI.GetModuleHandle(dllName);
             if (hModuleRemote == nint.Zero)
             {
-                Log.Debug("{Dll} not loaded – calling LoadLibraryA", dllName);
-                var bytes = System.Text.Encoding.ASCII.GetBytes(dllName + "\0");
-                var strAddr = FFI.AllocateMemory(hProcess, (uint)bytes.Length, FFI.PAGE_READWRITE);
-                FFI.WriteMemory(hProcess, strAddr, bytes);
+                switch (mode)
+                {
+                    case InjectionMode.ThreadHijacking:
+                        Log.Debug("{Dll} not loaded – loading via LdrLoadDll using thread hijack", dllName);
+                        LoadLibraryViaHijack(hProcess, pid, dllName);
+                        break;
 
-                var loadLib = FFI.GetProcAddress(FFI.GetModuleHandle("kernel32.dll"), "LoadLibraryA");
-                FFI.CreateRemoteThreadAndWait(hProcess, loadLib, strAddr, wait: false);
-                FFI.FreeMemory(hProcess, strAddr);
+                    case InjectionMode.CreateRemoteThread:
+                        Log.Debug("{Dll} not loaded – calling LdrLoadDll with remote thread", dllName);
+                        var wideBytes = System.Text.Encoding.Unicode.GetBytes(dllName + "\0");
+                        var remoteStr = FFI.AllocateMemory(hProcess, (uint)wideBytes.Length, FFI.PAGE_READWRITE);
+                        FFI.WriteMemory(hProcess, remoteStr, wideBytes);
+
+                        ushort len = (ushort)(wideBytes.Length - 2);
+                        var unicodeBuf = new byte[16];
+                        BitConverter.GetBytes(len).CopyTo(unicodeBuf, 0);
+                        BitConverter.GetBytes((ushort)wideBytes.Length).CopyTo(unicodeBuf, 2);
+                        BitConverter.GetBytes((ulong)remoteStr).CopyTo(unicodeBuf, 8);
+                        var remoteUnicode = FFI.AllocateMemory(hProcess, 16, FFI.PAGE_READWRITE);
+                        FFI.WriteMemory(hProcess, remoteUnicode, unicodeBuf);
+
+                        var remoteHandle = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
+                        FFI.WriteMemory(hProcess, remoteHandle, new byte[8]);
+
+                        var ldrLoadDll = FFI.GetProcAddress(FFI.GetModuleHandle("ntdll.dll"), "LdrLoadDll");
+                        var wrapper = CreateDllLoadWrapper(hProcess, (ulong)ldrLoadDll, (ulong)remoteUnicode, (ulong)remoteHandle);
+                        FFI.CreateRemoteThreadAndWait(hProcess, wrapper, nint.Zero, wait: true);
+                        FFI.FreeMemory(hProcess, wrapper);
+
+                        FFI.FreeMemory(hProcess, remoteStr);
+                        FFI.FreeMemory(hProcess, remoteUnicode);
+                        FFI.FreeMemory(hProcess, remoteHandle);
+                        break;
+                    default:
+                        throw new ArgumentException($"Unsupported injection mode: {mode.GetType().Name}");
+                }
             }
 
             int thunkIdx = 0;
@@ -211,7 +239,7 @@ public static class ManualMapper
                 {
                     ushort ordinal = (ushort)(importRef & 0xFFFF);
                     funcPtr = FFI.GetProcAddress(FFI.GetModuleHandle(dllName), ordinal);
-                    identifier = "ordinal #" + ordinal;
+                    identifier = $"ordinal #{ordinal}";
                 }
                 else
                 {
@@ -528,10 +556,13 @@ public static class ManualMapper
         void Emit(params byte[] bytes) => b.AddRange(bytes);
         void MovRegImm64(byte reg, ulong imm)
         {
-            if (reg < 8)
-                Emit(0x48, (byte)(0xB8 + reg));
-            else
-                Emit(0x49, (byte)(0xB8 + (reg - 8)));
+            var prefix = reg switch
+            {
+                < 8 => 0x48,
+                _ => 0x49
+            };
+            var opcode = reg < 8 ? (byte)(0xB8 + reg) : (byte)(0xB8 + (reg - 8));
+            Emit((byte)prefix, opcode);
             Emit(BitConverter.GetBytes(imm));
         }
 
@@ -596,14 +627,15 @@ public static class ManualMapper
         Emit(0x59);
         Emit(0x58);
 
-        if (originalRip == 0)
+        switch (originalRip)
         {
-            Emit(0xC3);
-        }
-        else
-        {
-            MovRegImm64(0, originalRip);
-            Emit(0xFF, 0xE0);
+            case 0:
+                Emit(0xC3);
+                break;
+            default:
+                MovRegImm64(0, originalRip);
+                Emit(0xFF, 0xE0);
+                break;
         }
 
         return [.. b];
@@ -673,10 +705,13 @@ public static class ManualMapper
         void Emit(params byte[] bytes) => b.AddRange(bytes);
         void MovRegImm64(byte reg, ulong imm)
         {
-            if (reg < 8)
-                Emit(0x48, (byte)(0xB8 + reg));
-            else
-                Emit(0x49, (byte)(0xB8 + (reg - 8)));
+            var prefix = reg switch
+            {
+                < 8 => 0x48,
+                _ => 0x49
+            };
+            var opcode = reg < 8 ? (byte)(0xB8 + reg) : (byte)(0xB8 + (reg - 8));
+            Emit((byte)prefix, opcode);
             Emit(BitConverter.GetBytes(imm));
         }
 
@@ -737,4 +772,122 @@ public static class ManualMapper
         FFI.PostThreadMessage(tid, WM_NULL, 0, nint.Zero);
         FFI.NtAlertThread(hThread);
     }
+
+    private static nint CreateDllLoadWrapper(nint hProcess, ulong ldrLoadDllAddr, ulong remoteUnicodeAddr, ulong remoteHandleAddr)
+    {
+        List<byte> b = [];
+        void Emit(params byte[] bytes) => b.AddRange(bytes);
+        void MovRegImm64(byte reg, ulong imm)
+        {
+            var prefix = reg switch
+            {
+                < 8 => 0x48,
+                _ => 0x49
+            };
+            var opcode = reg < 8 ? (byte)(0xB8 + reg) : (byte)(0xB8 + (reg - 8));
+            Emit((byte)prefix, opcode);
+            Emit(BitConverter.GetBytes(imm));
+        }
+
+        Emit(0x48, 0x83, 0xEC, 0x28);
+        MovRegImm64(1, 0);            // RCX = PathToFile (NULL)
+        MovRegImm64(2, 0);            // RDX = Flags (0)
+        MovRegImm64(8, remoteUnicodeAddr); // R8  = PUNICODE_STRING
+        MovRegImm64(9, remoteHandleAddr);  // R9  = Module handle out
+        MovRegImm64(10, ldrLoadDllAddr);   // R10 = LdrLoadDll
+        Emit(0x41, 0xFF, 0xD2);            // call r10
+        Emit(0x48, 0x83, 0xC4, 0x28);
+        Emit(0xC3);
+
+        var stub = b.ToArray();
+        var remote = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
+        FFI.WriteMemory(hProcess, remote, stub);
+        FFI.ProtectMemory(hProcess, remote, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
+        FFI.FlushInstructionCache(hProcess, remote, (uint)stub.Length);
+        return remote;
+    }
+
+    private static void LoadLibraryViaHijack(nint hProcess, int pid, string dllName)
+    {
+        var wideBytes = System.Text.Encoding.Unicode.GetBytes(dllName + "\0");
+        var remoteStr = FFI.AllocateMemory(hProcess, (uint)wideBytes.Length, FFI.PAGE_READWRITE);
+        FFI.WriteMemory(hProcess, remoteStr, wideBytes);
+
+        ushort len = (ushort)(wideBytes.Length - 2);
+        var unicodeBuf = new byte[16];
+        BitConverter.GetBytes(len).CopyTo(unicodeBuf, 0);
+        BitConverter.GetBytes((ushort)wideBytes.Length).CopyTo(unicodeBuf, 2);
+        BitConverter.GetBytes((ulong)remoteStr).CopyTo(unicodeBuf, 8);
+        var remoteUnicode = FFI.AllocateMemory(hProcess, 16, FFI.PAGE_READWRITE);
+        FFI.WriteMemory(hProcess, remoteUnicode, unicodeBuf);
+
+        var remoteHandle = FFI.AllocateMemory(hProcess, 8, FFI.PAGE_READWRITE);
+        FFI.WriteMemory(hProcess, remoteHandle, new byte[8]);
+
+        var ldrLoadDll = FFI.GetProcAddress(FFI.GetModuleHandle("ntdll.dll"), "LdrLoadDll");
+
+        using var snap = new ThreadSnapshot(pid);
+        var (active, blocked) = FindCandidateThreads(snap);
+        var thread = active ?? blocked ?? throw new Exception("No suitable thread to hijack");
+        bool needsWake = active == null;
+
+        try
+        {
+            if (!thread.TryGetContext(out var ctx)) throw new Exception("Failed to get context");
+            var stub = BuildLdrLoadDllCallStub((ulong)ldrLoadDll, (ulong)remoteUnicode, (ulong)remoteHandle, ctx.Rip);
+            var remoteStub = FFI.AllocateMemory(hProcess, (uint)stub.Length, FFI.PAGE_EXECUTE_READWRITE);
+            FFI.WriteMemory(hProcess, remoteStub, stub);
+            FFI.ProtectMemory(hProcess, remoteStub, (uint)stub.Length, FFI.PAGE_EXECUTE_READ);
+            FFI.FlushInstructionCache(hProcess, remoteStub, (uint)stub.Length);
+            ctx.Rip = (ulong)remoteStub;
+            if (!thread.TrySetContext(ctx)) throw new Exception("Failed to set context");
+            thread.ResumeCompletely();
+            if (needsWake) WakeThread(thread.Id, thread.Handle);
+            System.Threading.Thread.Sleep(50);
+        }
+        finally
+        {
+            thread.Dispose();
+        }
+
+        // Memory is kept allocated intentionally; it is negligible and avoids races if the module loads slowly.
+    }
+
+    private static byte[] BuildLdrLoadDllCallStub(ulong ldrLoadDllAddr, ulong unicodeStringPtr, ulong moduleHandlePtr, ulong originalRip)
+    {
+        List<byte> b = [];
+        void Emit(params byte[] bytes) => b.AddRange(bytes);
+        void MovRegImm64(byte reg, ulong imm)
+        {
+            var prefix = reg switch
+            {
+                < 8 => 0x48,
+                _ => 0x49
+            };
+            var opcode = reg < 8 ? (byte)(0xB8 + reg) : (byte)(0xB8 + (reg - 8));
+            Emit((byte)prefix, opcode);
+            Emit(BitConverter.GetBytes(imm));
+        }
+
+        Emit(0x48, 0x83, 0xEC, 0x28);
+        MovRegImm64(1, 0);
+        MovRegImm64(2, 0);
+        MovRegImm64(8, unicodeStringPtr);
+        MovRegImm64(9, moduleHandlePtr);
+        MovRegImm64(10, ldrLoadDllAddr);
+        Emit(0x41, 0xFF, 0xD2);
+        Emit(0x48, 0x83, 0xC4, 0x28);
+        switch (originalRip)
+        {
+            case 0:
+                Emit(0xC3);
+                break;
+            default:
+                MovRegImm64(0, originalRip);
+                Emit(0xFF, 0xE0);
+                break;
+        }
+        return [.. b];
+    }
+
 }
