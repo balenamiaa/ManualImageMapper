@@ -237,4 +237,25 @@ public static partial class FFI
         public nint Flink;
         public nint Blink;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID_AND_ATTRIBUTES
+    {
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_PRIVILEGES
+    {
+        public uint PrivilegeCount;
+        public LUID_AND_ATTRIBUTES Privilege;
+    }
 }

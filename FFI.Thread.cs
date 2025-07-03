@@ -10,7 +10,10 @@ public static partial class FFI
     public const uint CONTEXT_AMD64 = 0x00100000;
     public const uint CONTEXT_CONTROL = CONTEXT_AMD64 | 0x00000001;
     public const uint CONTEXT_INTEGER = CONTEXT_AMD64 | 0x00000002;
-    public const uint CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    public const uint CONTEXT_SEGMENTS = CONTEXT_AMD64 | 0x00000004;
+    public const uint CONTEXT_FLOATING_POINT = CONTEXT_AMD64 | 0x00000008;
+    public const uint CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x00000010;
+    public const uint CONTEXT_ALL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
 
     public const uint TH32CS_SNAPTHREAD = 0x00000004;
 
@@ -31,7 +34,7 @@ public static partial class FFI
     }
 
     // A minimal x64 CONTEXT structure – contains only the fields we need (RIP + general regs)
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 16, Size = 0x4D0)]
     public unsafe struct CONTEXT64
     {
         public ulong P1Home;

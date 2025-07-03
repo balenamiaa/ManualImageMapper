@@ -53,4 +53,22 @@ public static partial class FFI
         ProcessBasicInformation = 0
     }
 
+    public enum ImageDirectoryEntry : int
+    {
+        EXPORT = 0,
+        IMPORT = 1,
+        RESOURCE = 2,
+        EXCEPTION = 3,
+        SECURITY = 4,
+        BASERELOC = 5,
+        DEBUG = 6,
+        ARCHITECTURE = 7,
+        GLOBALPTR = 8,
+        TLS = 9,
+        LOAD_CONFIG = 10,
+        BOUND_IMPORT = 11,
+        IAT = 12,
+        DELAY_IMPORT = 13,
+        COM_DESCRIPTOR = 14
+    }
 }

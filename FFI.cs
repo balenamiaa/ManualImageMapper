@@ -1,12 +1,15 @@
 using System.Runtime.InteropServices;
 using System;
 using System.Collections.Generic;
+using Serilog;
 
 namespace ManualImageMapper;
 
 
 public static partial class FFI
 {
+    private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(FFI));
+
     #region Native Methods
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
@@ -22,7 +25,7 @@ public static partial class FFI
     [LibraryImport("kernel32.dll", SetLastError = true)]
     public static partial nint GetProcAddress(nint hModule, nint procName);
 
-    [LibraryImport("kernel32.dll", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleA", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     public static partial nint GetModuleHandle(string lpModuleName);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
@@ -53,6 +56,20 @@ public static partial class FFI
     [LibraryImport("ntdll.dll")]
     public static partial int NtQueryInformationProcess(nint ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, out PROCESS_BASIC_INFORMATION ProcessInformation, int ProcessInformationLength, out int ReturnLength);
 
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool OpenProcessToken(nint ProcessHandle, uint DesiredAccess, out nint TokenHandle);
+
+    [LibraryImport("advapi32.dll", EntryPoint = "LookupPrivilegeValueA", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool AdjustTokenPrivileges(nint TokenHandle, [MarshalAs(UnmanagedType.Bool)] bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, nint PreviousState, nint ReturnLength);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial nint GetCurrentProcess();
 
     #endregion
 
@@ -72,6 +89,7 @@ public static partial class FFI
         var handle = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
         if (handle == nint.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), $"OpenProcess failed for PID {pid}");
+        Log.Debug("Opened process {Pid} -> 0x{Handle:X}", pid, (ulong)handle);
         return handle;
     }
 
@@ -94,6 +112,7 @@ public static partial class FFI
         var addr = VirtualAllocEx(hProcess, nint.Zero, size, MEM_COMMIT | MEM_RESERVE, protection);
         if (addr == nint.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "VirtualAllocEx failed");
+        Log.Debug("Allocated {Size} bytes in target at 0x{Addr:X} (prot 0x{Prot:X})", size, (ulong)addr, protection);
         return addr;
     }
 
@@ -103,6 +122,7 @@ public static partial class FFI
     public static void FreeMemory(nint hProcess, nint address)
     {
         if (address == nint.Zero) return;
+        Log.Debug("Freeing remote memory at 0x{Addr:X}", (ulong)address);
         if (!VirtualFreeEx(hProcess, address, 0, MEM_RELEASE))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "VirtualFreeEx failed");
     }
@@ -114,6 +134,7 @@ public static partial class FFI
     {
         if (!WriteProcessMemory(hProcess, baseAddress, data, (uint)data.Length, out _))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WriteProcessMemory failed");
+        Log.Verbose("Wrote {Len} bytes to 0x{Addr:X}", data.Length, (ulong)baseAddress);
     }
 
     /// <summary>
@@ -124,6 +145,7 @@ public static partial class FFI
         var buffer = new byte[size];
         if (!ReadProcessMemory(hProcess, baseAddress, buffer, size, out _))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "ReadProcessMemory failed");
+        Log.Verbose("Read {Len} bytes from 0x{Addr:X}", size, (ulong)baseAddress);
         return buffer;
     }
 
@@ -135,6 +157,7 @@ public static partial class FFI
     {
         if (!VirtualProtectEx(hProcess, address, size, newProtect, out var oldProtect))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "VirtualProtectEx failed");
+        Log.Debug("Protect 0x{Addr:X} size {Size} -> 0x{NewProt:X} (old 0x{Old:X})", (ulong)address, size, newProtect, oldProtect);
         return oldProtect;
     }
 
@@ -148,9 +171,15 @@ public static partial class FFI
         if (hThread == nint.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "CreateRemoteThread failed");
 
+        Log.Debug("Created remote thread 0x{Thread:X} start 0x{Start:X} param 0x{Param:X}", (ulong)hThread, (ulong)startAddress, (ulong)parameter);
+
         if (wait)
         {
             WaitForSingleObject(hThread, INFINITE);
+            // Close handle when we are done waiting – caller usually doesn't need it
+            Log.Verbose("Waited for thread 0x{Thread:X} to finish", (ulong)hThread);
+            CloseHandleSafe(hThread);
+            return nint.Zero;
         }
         return hThread;
     }
@@ -239,29 +268,95 @@ public static partial class FFI
     }
 
     /// <summary>
-    /// Writes each PE section into remote memory with initial RW permissions, then sets the final permissions based on the section characteristics.
+    /// Writes each PE section into remote memory. By default sections stay RW; set <paramref name="applyFinalProtection"/> to <c>true</c> to immediately assign final RX/RWX permissions.
     /// </summary>
-    public static void MapSections(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
+    public static void MapSections(nint hProcess, nint remoteBase, ReadOnlySpan<byte> localImage, IReadOnlyList<IMAGE_SECTION_HEADER> sections, bool applyFinalProtection = false)
     {
+        Log.Debug("MapSections copying {Count} sections", sections.Count);
+
+        int idx = 0;
         foreach (var section in sections)
         {
-            // Determine local section slice
             var rawOffset = (int)section.PointerToRawData;
             var rawSize = (int)section.SizeOfRawData;
             var slice = localImage.Slice(rawOffset, rawSize);
 
-            // Write to remote
             var remoteAddress = remoteBase + (int)section.VirtualAddress;
-            WriteMemory(hProcess, remoteAddress, slice.ToArray()); // using Span, ToArray for convenience
+            WriteMemory(hProcess, remoteAddress, slice.ToArray());
+            Log.Verbose("Section #{Idx} VA 0x{VA:X} rawSize {Size}", idx++, section.VirtualAddress, rawSize);
         }
 
-        // Second pass: set final protection
+        if (applyFinalProtection)
+        {
+            SetSectionProtections(hProcess, remoteBase, sections);
+        }
+    }
+
+    /// <summary>
+    /// Iterates sections and applies their final protection flags (R/O, RX, etc.). Call this after all relocations & IAT patching are finished.
+    /// </summary>
+    public static void SetSectionProtections(nint hProcess, nint remoteBase, IReadOnlyList<IMAGE_SECTION_HEADER> sections)
+    {
         foreach (var section in sections)
         {
-            var size = AlignUp(section.VirtualSize, 0x1000); // page align
+            var size = AlignUp(section.VirtualSize, 0x1000);
             var prot = CharacteristicsToProtection(section.Characteristics);
             var remoteAddress = remoteBase + (int)section.VirtualAddress;
             ProtectMemory(hProcess, remoteAddress, size, prot);
+        }
+    }
+
+    /// <summary>
+    /// Attempts to enable SeDebugPrivilege for the current process to allow thread hijacking.
+    /// Returns true if successful, false otherwise.
+    /// </summary>
+    public static bool EnableSeDebugPrivilege()
+    {
+        try
+        {
+            var currentProcess = GetCurrentProcess();
+            if (!OpenProcessToken(currentProcess, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var tokenHandle))
+            {
+                Log.Warning("Failed to open process token for privilege adjustment (err {Err})", Marshal.GetLastWin32Error());
+                return false;
+            }
+
+            try
+            {
+                if (!LookupPrivilegeValue(null!, SE_DEBUG_NAME, out var luid))
+                {
+                    Log.Warning("Failed to lookup SeDebugPrivilege (err {Err})", Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                var privileges = new TOKEN_PRIVILEGES
+                {
+                    PrivilegeCount = 1,
+                    Privilege = new LUID_AND_ATTRIBUTES
+                    {
+                        Luid = new LUID { LowPart = (uint)luid, HighPart = (int)(luid >> 32) },
+                        Attributes = SE_PRIVILEGE_ENABLED
+                    }
+                };
+
+                if (!AdjustTokenPrivileges(tokenHandle, false, ref privileges, 0, nint.Zero, nint.Zero))
+                {
+                    Log.Warning("Failed to adjust token privileges (err {Err})", Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                Log.Debug("Successfully enabled SeDebugPrivilege");
+                return true;
+            }
+            finally
+            {
+                CloseHandleSafe(tokenHandle);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Exception while enabling SeDebugPrivilege");
+            return false;
         }
     }
 
