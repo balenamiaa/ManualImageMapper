@@ -1,8 +1,9 @@
 bin/
 obj/
-.vscode/
 .idea/
 .vs/
 .vscode/
-.vscode/
 .dll
+.claude/
+
+target/

@@ -2,9 +2,8 @@
 using Serilog;
 using ManualImageMapper;
 
-using static ManualImageMapper.WinApi.Methods;
+using static ManualImageMapper.Interop.Win32;
 
-// Configure Serilog
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
     .WriteTo.Console()
@@ -17,7 +16,7 @@ var cmdArgs = Environment.GetCommandLineArgs();
 if (cmdArgs.Length < 3 || cmdArgs.Length > 4)
 {
     logger.Information("Usage: {Usage} <dll path> <process name or pid> [method]", Path.GetFileName(cmdArgs[0]));
-    logger.Information("  method: 'hijack' (default) or 'thread' for CreateRemoteThread");
+    logger.Information("  method: 'hijack' (default), 'hijack-debug' (with diagnostics), or 'thread' for CreateRemoteThread");
     return;
 }
 
@@ -28,8 +27,9 @@ string method = cmdArgs.Length > 3 ? cmdArgs[3].ToLowerInvariant() : "hijack";
 InjectionMode injectionMode = method switch
 {
     "hijack" or "h" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: false, LogGeneratedStub: false),
+    "hijack-debug" or "hd" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: true, LogGeneratedStub: true),
     "thread" or "t" => new InjectionMode.CreateRemoteThread(),
-    _ => throw new ArgumentException($"Invalid method '{cmdArgs[3]}'. Use 'hijack' or 'thread'.")
+    _ => throw new ArgumentException($"Invalid method '{cmdArgs[3]}'. Use 'hijack', 'hijack-debug', or 'thread'.")
 };
 
 if (!File.Exists(dllPath))
