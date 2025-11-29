@@ -1524,42 +1524,4 @@ public static partial class ManualMapper
         return loadedHandle;
     }
 
-    // Keep BuildLdrLoadDllCallStub for potential future use, but it's no longer used for dependency loading
-    private static byte[] BuildLdrLoadDllCallStub(ulong ldrLoadDllAddr, ulong unicodeStringPtr, ulong moduleHandlePtr, ulong originalRip)
-    {
-        List<byte> b = [];
-        void Emit(params byte[] bytes) => b.AddRange(bytes);
-        void MovRegImm64(byte reg, ulong imm)
-        {
-            var prefix = reg switch
-            {
-                < 8 => 0x48,
-                _ => 0x49
-            };
-            var opcode = reg < 8 ? (byte)(0xB8 + reg) : (byte)(0xB8 + (reg - 8));
-            Emit((byte)prefix, opcode);
-            Emit(BitConverter.GetBytes(imm));
-        }
-
-        Emit(0x48, 0x83, 0xEC, 0x28);
-        MovRegImm64(1, 0);
-        MovRegImm64(2, 0);
-        MovRegImm64(8, unicodeStringPtr);
-        MovRegImm64(9, moduleHandlePtr);
-        MovRegImm64(10, ldrLoadDllAddr);
-        Emit(0x41, 0xFF, 0xD2);
-        Emit(0x48, 0x83, 0xC4, 0x28);
-        switch (originalRip)
-        {
-            case 0:
-                Emit(0xC3);
-                break;
-            default:
-                MovRegImm64(0, originalRip);
-                Emit(0xFF, 0xE0);
-                break;
-        }
-        return [.. b];
-    }
-
 }
