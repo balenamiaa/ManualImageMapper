@@ -781,7 +781,7 @@ public static partial class ManualMapper
         if (originalRip == 0)
             b.Ret();
         else
-            b.Mov_Reg_Imm64(0, originalRip).Jmp_Rax();
+            b.Jmp_RipRelative(originalRip);  // RIP-relative jump preserves all registers
 
         return b.Build();
     }
@@ -1121,6 +1121,15 @@ public static partial class ManualMapper
         public StubBuilder Jmp_Rax() => Emit(0xFF, 0xE0);
         public StubBuilder Jb(byte offset) => Emit(0x72, offset);
         public StubBuilder Jae(byte offset) => Emit(0x73, offset);
+
+        /// <summary>
+        /// RIP-relative indirect jump. Reads target address from inline data.
+        /// Does not modify any registers - safe for use after restoring thread state.
+        /// </summary>
+        public StubBuilder Jmp_RipRelative(ulong targetAddr) =>
+            Emit(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00)  // jmp qword ptr [rip+0]
+            .Emit(BitConverter.GetBytes(targetAddr));
+
         public StubBuilder Jmp_Indirect(ulong addr) => Emit(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00).Emit(BitConverter.GetBytes(addr));
 
         #endregion
