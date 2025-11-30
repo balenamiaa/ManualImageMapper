@@ -1,15 +1,3 @@
-// =============================================================================
-// Constants.cs - All Constants and Magic Numbers
-// =============================================================================
-//
-// This file centralizes all constants used throughout the manual mapper.
-// Organized by category for easy maintenance.
-//
-// MAINTENANCE NOTES:
-// - When adding Windows version-specific values, document the version
-// - PEB/LDR offsets are for Windows 10/11 x64 - update for other versions
-// =============================================================================
-
 namespace ManualImageMapper.Interop;
 
 /// <summary>
@@ -30,11 +18,17 @@ public static class Constants
     /// <summary>Written when stub begins executing.</summary>
     public const ulong DEBUG_MARKER_ENTRY = 0x1111111111111111;
 
+    /// <summary>Written after TLS callbacks complete.</summary>
+    public const ulong DEBUG_MARKER_POST_TLS = 0x3333333333333333;
+
     /// <summary>Written just before calling DllMain.</summary>
     public const ulong DEBUG_MARKER_PRE_DLLMAIN = 0x2222222222222222;
 
     /// <summary>Written after DllMain returns successfully.</summary>
     public const ulong DEBUG_MARKER_POST_DLLMAIN = 0x1337DEADBEEFCAFE;
+
+    /// <summary>Written after DotnetMain returns successfully.</summary>
+    public const ulong DEBUG_MARKER_POST_DOTNETMAIN = 0x4444444444444444;
 
     // =========================================================================
     // PE FORMAT CONSTANTS

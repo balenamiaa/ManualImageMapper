@@ -1,41 +1,3 @@
-// =============================================================================
-// PebLinker.cs - PEB Integration and CRT Initialization
-// =============================================================================
-//
-// This module handles linking manually mapped modules into the Windows loader's
-// Process Environment Block (PEB) data structures. This is CRITICAL for CRT
-// support because the C Runtime expects modules to be registered with the loader.
-//
-// WHY PEB LINKING IS NECESSARY:
-// -----------------------------
-// When Windows loads a DLL normally (LoadLibrary), it:
-// 1. Creates an LDR_DATA_TABLE_ENTRY structure for the module
-// 2. Links it into three doubly-linked lists in the PEB
-// 3. Calls LdrpHandleTlsData to initialize Thread Local Storage
-// 4. Calls DllMain
-//
-// For manually mapped DLLs, we must do steps 1-3 ourselves. Without this:
-// - CRT initialization fails (it checks loader data structures)
-// - TLS doesn't work (errno, thread-local state, etc.)
-// - Some APIs fail (they query module lists)
-//
-// PEB STRUCTURE OVERVIEW:
-// -----------------------
-// PEB (Process Environment Block)
-//   └─ Ldr (PEB_LDR_DATA)
-//        ├─ InLoadOrderModuleList      - All modules in load order
-//        ├─ InMemoryOrderModuleList    - All modules by memory address
-//        └─ InInitializationOrderModuleList - Modules in init order
-//
-// Each list contains LDR_DATA_TABLE_ENTRY structures linked together.
-// We create a new entry and insert it at the tail of each list.
-//
-// MAINTENANCE NOTES:
-// - PEB/LDR offsets are Windows version specific (see Constants.cs)
-// - The LDR_DATA_TABLE_ENTRY layout changes between Windows versions
-// - Always test CRT DLLs after Windows updates
-// =============================================================================
-
 using System.Runtime.InteropServices;
 using Serilog;
 using static ManualImageMapper.Interop.Structures;
@@ -202,6 +164,11 @@ public static class PebLinker
     /// Without this, CRT DLLs will crash during initialization because:
     /// - CRT checks if the module is registered with the loader
     /// - CRT uses TLS for errno, thread state, etc.
+    ///
+    /// IMPORTANT: This variant calls LdrpHandleTlsData via CreateRemoteThread,
+    /// which only initializes TLS for THAT thread. For thread hijacking or
+    /// when TLS must work on a specific thread, use InitializeCrtModulePebOnly
+    /// and call LdrpHandleTlsData from within that thread's context.
     /// </summary>
     /// <returns>Address of LDR_DATA_TABLE_ENTRY, or Zero on failure.</returns>
     public static nint InitializeCrtModule(
@@ -278,11 +245,37 @@ public static class PebLinker
                 Log.Warning(ex, "Failed to execute LdrpHandleTlsData stub");
             }
 
-            // Verify TlsIndex was set
+            // Verify TlsIndex was set - check both LDR entry and actual _tls_index in DLL
             int tlsIndexOffset = (int)Marshal.OffsetOf<LDR_DATA_TABLE_ENTRY>("TlsIndex");
             var tlsIndexBytes = MemoryHelpers.ReadMemory(hProcess, remoteLdrEntry + tlsIndexOffset, 2);
-            ushort tlsIndex = BitConverter.ToUInt16(tlsIndexBytes);
-            Log.Debug("TLS initialization complete, TlsIndex = 0x{TlsIndex:X}", tlsIndex);
+            ushort ldrTlsIndex = BitConverter.ToUInt16(tlsIndexBytes);
+            Log.Debug("LDR_DATA_TABLE_ENTRY.TlsIndex = 0x{TlsIndex:X}", ldrTlsIndex);
+
+            // Also read the actual _tls_index from the DLL's TLS directory
+            // This is what the DLL code actually uses
+            try
+            {
+                // Read PE headers to find TLS directory
+                var dosHeader = PeHelpers.GetDosHeader(MemoryHelpers.ReadMemory(hProcess, moduleBase, 64));
+                var ntHeadersBytes = MemoryHelpers.ReadMemory(hProcess, moduleBase + dosHeader.e_lfanew, Marshal.SizeOf<IMAGE_NT_HEADERS64>());
+                var nt = MemoryHelpers.BytesToStructure<IMAGE_NT_HEADERS64>(ntHeadersBytes);
+                var tlsDir = nt.OptionalHeader.DataDirectory[(int)ImageDirectoryEntry.TLS];
+
+                if (tlsDir.Size > 0)
+                {
+                    var tlsBytes = MemoryHelpers.ReadMemory(hProcess, moduleBase + (int)tlsDir.VirtualAddress, Marshal.SizeOf<IMAGE_TLS_DIRECTORY64>());
+                    var tls = MemoryHelpers.BytesToStructure<IMAGE_TLS_DIRECTORY64>(tlsBytes);
+
+                    // Read the actual _tls_index value from AddressOfIndex
+                    var actualIndexBytes = MemoryHelpers.ReadMemory(hProcess, (nint)tls.AddressOfIndex, 4);
+                    uint actualTlsIndex = BitConverter.ToUInt32(actualIndexBytes);
+                    Log.Debug("Actual _tls_index at 0x{Addr:X} = 0x{Value:X}", tls.AddressOfIndex, actualTlsIndex);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to read actual _tls_index");
+            }
         }
         finally
         {
@@ -291,6 +284,57 @@ public static class PebLinker
         }
 
         return remoteLdrEntry;
+    }
+
+    /// <summary>
+    /// Initializes CRT support by linking the module to PEB only.
+    /// Does NOT call LdrpHandleTlsData - this must be called from the
+    /// thread that will execute the DLL code (hijacked thread or main thread).
+    ///
+    /// Also returns the LdrpHandleTlsData address so the caller can call it
+    /// from the correct thread context.
+    /// </summary>
+    /// <returns>Tuple of (LDR entry address, LdrpHandleTlsData address) or (Zero, Zero) on failure.</returns>
+    public static (nint remoteLdrEntry, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(
+        nint hProcess,
+        int pid,
+        nint moduleBase,
+        uint sizeOfImage,
+        nint entryPoint,
+        ulong originalImageBase,
+        string dllName)
+    {
+        string fullPath = $"C:\\Windows\\System32\\{dllName}";
+
+        var remoteLdrEntry = LinkModuleToPEB(hProcess, pid, moduleBase, sizeOfImage,
+            entryPoint, originalImageBase, dllName, fullPath);
+
+        if (remoteLdrEntry == nint.Zero)
+        {
+            Log.Warning("Failed to link module to PEB");
+            return (nint.Zero, nint.Zero);
+        }
+
+        // Find LdrpHandleTlsData address but don't call it yet
+        var funcOffset = PatternScanner.FindLdrpHandleTlsDataOffset();
+        if (funcOffset < 0)
+        {
+            Log.Warning("LdrpHandleTlsData not found - TLS may not work correctly");
+            return (remoteLdrEntry, nint.Zero);
+        }
+
+        var remoteNtdll = ModuleHelpers.GetRemoteModuleHandle(hProcess, pid, "ntdll.dll");
+        if (remoteNtdll == nint.Zero)
+        {
+            Log.Warning("Could not find ntdll.dll in remote process");
+            return (remoteLdrEntry, nint.Zero);
+        }
+
+        var ldrpHandleTlsData = remoteNtdll + funcOffset;
+        Log.Debug("LdrpHandleTlsData at 0x{Addr:X}, LDR entry at 0x{Entry:X} - will be called from stub",
+            (ulong)ldrpHandleTlsData, (ulong)remoteLdrEntry);
+
+        return (remoteLdrEntry, ldrpHandleTlsData);
     }
 
     /// <summary>

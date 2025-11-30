@@ -1,38 +1,3 @@
-// =============================================================================
-// ExportResolver.cs - DLL Export Resolution with Forwarding Support
-// =============================================================================
-//
-// This module handles resolving function addresses from remote process DLLs
-// by reading their export tables. Critically, it handles FORWARDED EXPORTS.
-//
-// FORWARDED EXPORTS EXPLAINED:
-// ----------------------------
-// Some exports don't contain actual code - they redirect to another DLL.
-// For example, kernel32!InitializeSListHead forwards to ntdll!RtlInitializeSListHead.
-//
-// In the export table, a forwarded export's RVA points to a string within
-// the export directory itself (between exportDir.VirtualAddress and
-// exportDir.VirtualAddress + exportDir.Size). This string contains the
-// target in the format "DLL.FunctionName" (e.g., "NTDLL.RtlInitializeSListHead").
-//
-// BUG WE FIXED:
-// The original code didn't check for forwarders, so it returned a pointer
-// to the forwarder STRING instead of the actual function. When the caller
-// tried to execute this "function", it crashed because it was executing
-// ASCII text as machine code!
-//
-// The crash manifested as:
-//   kernel32_InitializeSListHead:
-//   push rsp                    ; These aren't real instructions!
-//   imul esi, [...], 657A696Ch  ; "lize" in ASCII
-//   ...                         ; "Head" in ASCII
-//
-// MAINTENANCE NOTES:
-// - When adding support for new Windows versions, test that export
-//   forwarding still works correctly (many kernel32 functions forward)
-// - The recursion depth limit prevents infinite loops on circular forwarders
-// =============================================================================
-
 using System.Runtime.InteropServices;
 using Serilog;
 using static ManualImageMapper.Interop.Structures;
@@ -143,6 +108,9 @@ public static class ExportResolver
     ///
     /// Forwarder string format: "DllName.FunctionName"
     /// Example: "NTDLL.RtlInitializeSListHead"
+    ///
+    /// IMPORTANT: Handles API Set DLLs (api-ms-win-*) which are virtual DLLs
+    /// that don't exist as real modules. We resolve them to their real DLLs.
     /// </summary>
     private static nint ResolveForwardedExport(
         nint hProcess,
@@ -174,6 +142,13 @@ public static class ExportResolver
 
         // Get the forwarded DLL's base in the remote process
         var forwardModuleBase = ModuleHelpers.GetRemoteModuleHandle(hProcess, pid, forwardDll);
+
+        // If not found and it's an API Set, resolve to real DLL
+        if (forwardModuleBase == nint.Zero && IsApiSetDll(forwardDll))
+        {
+            forwardModuleBase = ResolveApiSetToRealModule(hProcess, pid, forwardDll);
+        }
+
         if (forwardModuleBase == nint.Zero)
         {
             Log.Warning("Forwarded DLL not found: {Dll}", forwardDll);
@@ -182,6 +157,72 @@ public static class ExportResolver
 
         // Recursively resolve from the forwarded DLL
         return GetRemoteProcAddress(hProcess, forwardModuleBase, forwardFunc, pid, recursionDepth + 1);
+    }
+
+    /// <summary>
+    /// Checks if a DLL name is an API Set (virtual DLL).
+    /// API Sets have names like "api-ms-win-*" or "ext-ms-*".
+    /// </summary>
+    private static bool IsApiSetDll(string dllName)
+    {
+        return dllName.StartsWith("api-ms-", StringComparison.OrdinalIgnoreCase) ||
+               dllName.StartsWith("ext-ms-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resolves an API Set DLL to its real implementation DLL.
+    ///
+    /// API Sets are virtual DLLs that Windows maps to real DLLs at load time.
+    /// Common mappings:
+    /// - api-ms-win-core-* → kernelbase.dll (most common)
+    /// - api-ms-win-crt-* → ucrtbase.dll
+    /// - api-ms-win-core-com-* → combase.dll
+    /// - ext-ms-* → various
+    /// </summary>
+    private static nint ResolveApiSetToRealModule(nint hProcess, int pid, string apiSetName)
+    {
+        // Common API Set mappings based on the API Set name patterns
+        // These are the most common fallback DLLs for API Sets
+        string[] fallbackDlls;
+
+        if (apiSetName.StartsWith("api-ms-win-crt-", StringComparison.OrdinalIgnoreCase))
+        {
+            fallbackDlls = ["ucrtbase.dll"];
+        }
+        else if (apiSetName.StartsWith("api-ms-win-core-com-", StringComparison.OrdinalIgnoreCase))
+        {
+            fallbackDlls = ["combase.dll"];
+        }
+        else if (apiSetName.StartsWith("api-ms-win-core-", StringComparison.OrdinalIgnoreCase) ||
+                 apiSetName.StartsWith("api-ms-win-", StringComparison.OrdinalIgnoreCase))
+        {
+            // Most api-ms-win-core-* and api-ms-win-* map to kernelbase.dll
+            // Some may also be in ntdll.dll
+            fallbackDlls = ["kernelbase.dll", "ntdll.dll", "kernel32.dll"];
+        }
+        else if (apiSetName.StartsWith("ext-ms-win-", StringComparison.OrdinalIgnoreCase))
+        {
+            // Extension API sets vary widely
+            fallbackDlls = ["kernelbase.dll", "kernel32.dll"];
+        }
+        else
+        {
+            // Generic fallback
+            fallbackDlls = ["kernelbase.dll", "ntdll.dll"];
+        }
+
+        foreach (var dll in fallbackDlls)
+        {
+            var moduleBase = ModuleHelpers.GetRemoteModuleHandle(hProcess, pid, dll);
+            if (moduleBase != nint.Zero)
+            {
+                Log.Verbose("Resolved API Set {ApiSet} -> {RealDll}", apiSetName, dll);
+                return moduleBase;
+            }
+        }
+
+        Log.Warning("Could not resolve API Set {ApiSet} to any known DLL", apiSetName);
+        return nint.Zero;
     }
 
     /// <summary>

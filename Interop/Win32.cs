@@ -1,37 +1,3 @@
-// =============================================================================
-// Win32.cs - Unified Windows Interop Facade
-// =============================================================================
-//
-// This file serves as the main entry point for all Windows interop functionality.
-// It re-exports types and methods from the modular files for backward compatibility
-// and convenience.
-//
-// MODULE ORGANIZATION:
-// -------------------
-// The interop layer is split into focused modules:
-//
-// - NativeMethods.cs   : P/Invoke declarations (all Windows API calls)
-// - Structures.cs      : PE format and Windows data structures
-// - Constants.cs       : All constants and magic numbers
-// - Helpers.cs         : Memory, process, module, and thread helpers
-// - ExportResolver.cs  : DLL export resolution with forwarding support
-// - PatternScanner.cs  : Finding internal Windows functions by pattern
-// - PebLinker.cs       : PEB integration for CRT/TLS support
-//
-// USAGE:
-// ------
-// You can either:
-// 1. Import this file: using static ManualImageMapper.Interop.Win32;
-// 2. Import specific modules: using ManualImageMapper.Interop;
-//
-// MAINTENANCE:
-// -----------
-// When adding new functionality:
-// 1. Add to the appropriate module (not here)
-// 2. Re-export here if needed for backward compatibility
-// 3. Update this header comment if adding new modules
-// =============================================================================
-
 using System.Runtime.InteropServices;
 
 namespace ManualImageMapper.Interop;
@@ -55,8 +21,10 @@ public static partial class Win32
         // Debug Markers
         public const ulong DEBUG_MARKER_INITIAL = Constants.DEBUG_MARKER_INITIAL;
         public const ulong DEBUG_MARKER_ENTRY = Constants.DEBUG_MARKER_ENTRY;
+        public const ulong DEBUG_MARKER_POST_TLS = Constants.DEBUG_MARKER_POST_TLS;
         public const ulong DEBUG_MARKER_PRE_DLLMAIN = Constants.DEBUG_MARKER_PRE_DLLMAIN;
         public const ulong DEBUG_MARKER_POST_DLLMAIN = Constants.DEBUG_MARKER_POST_DLLMAIN;
+        public const ulong DEBUG_MARKER_POST_DOTNETMAIN = Constants.DEBUG_MARKER_POST_DOTNETMAIN;
 
         // PE Format
         public const ulong IMAGE_ORDINAL_FLAG64 = Constants.IMAGE_ORDINAL_FLAG64;
@@ -242,6 +210,9 @@ public static partial class Win32
 
     public static nint InitializeCrtModule(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName) =>
         PebLinker.InitializeCrtModule(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName);
+
+    public static (nint remoteLdrEntry, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName) =>
+        PebLinker.InitializeCrtModulePebOnly(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName);
 
     public static void UnlinkFromPEB(nint hProcess, nint moduleBase) =>
         PebLinker.UnlinkFromPEB(hProcess, moduleBase);
