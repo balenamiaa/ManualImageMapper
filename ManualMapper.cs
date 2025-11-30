@@ -702,7 +702,13 @@ public static partial class ManualMapper
     }
 
     /// <summary>
-    /// Builds the thread hijacking stub that saves state, calls TLS/DllMain, erases headers, and restores.
+    /// Builds the thread hijacking stub that:
+    /// 1. Saves complete CPU state (GPRs, flags, x87/SSE/AVX via XSAVE)
+    /// 2. Initializes TLS via LdrpHandleTlsData
+    /// 3. Calls TLS callbacks and DllMain
+    /// 4. Optionally calls DotnetMain export
+    /// 5. Erases PE headers for stealth
+    /// 6. Restores CPU state and jumps back to original RIP
     /// </summary>
     private static byte[] BuildHijackStub(
         ulong moduleBase, ulong dllMain, ulong callbacksAddr, ulong originalRip,
@@ -710,20 +716,20 @@ public static partial class ManualMapper
     {
         var b = new StubBuilder();
 
-        // Save complete CPU state
+        // Save state: flags, GPRs, then XSAVE for FPU/SSE/AVX
         b.Pushfq().Cld()
          .Push_AllGpr()
          .Mov_Rbp_Rsp()
-         .And_Rsp_Align16()
-         .Sub_Rsp_Imm32(512)
-         .Fxsave64()
+         .And_Rsp_Align64()
+         .Sub_Rsp_Imm32(4096)
+         .ZeroXsaveHeader()
+         .Xsave64()
          .Sub_Rsp(0x20);
 
-        // Debug marker: entry
         if (debugMarker != 0)
             b.WriteDebugMarker(debugMarker, DEBUG_MARKER_ENTRY);
 
-        // Call LdrpHandleTlsData for TLS initialization (must be same thread as DllMain)
+        // TLS initialization via LdrpHandleTlsData
         if (ldrpHandleTlsData != 0 && ldrEntry != 0)
         {
             b.Mov_Reg_Imm64(1, ldrEntry)
@@ -735,26 +741,22 @@ public static partial class ManualMapper
                 b.WriteTlsResultMarker(debugMarker);
         }
 
-        // Call TLS callbacks
         if (callbacksAddr != 0)
             b.CallTlsCallbacks(callbacksAddr, moduleBase, debugMarker);
 
-        // Debug marker: pre-DllMain
         if (debugMarker != 0)
             b.WriteDebugMarker(debugMarker, DEBUG_MARKER_PRE_DLLMAIN);
 
-        // Call DllMain(moduleBase, DLL_PROCESS_ATTACH, NULL)
+        // DllMain(moduleBase, DLL_PROCESS_ATTACH, NULL)
         b.Mov_Reg_Imm64(1, moduleBase)
          .Mov_Edx_Imm32(1)
          .Xor_R8_R8()
          .Mov_Reg_Imm64(0, dllMain)
          .Call_Rax();
 
-        // Debug marker: post-DllMain
         if (debugMarker != 0)
             b.WriteDebugMarker(debugMarker, DEBUG_MARKER_POST_DLLMAIN);
 
-        // Call DotnetMain if provided
         if (dotnetMain != 0)
         {
             if (debugMarker != 0)
@@ -766,18 +768,16 @@ public static partial class ManualMapper
                 b.WriteDebugMarker(debugMarker, DEBUG_MARKER_POST_DOTNETMAIN);
         }
 
-        // Erase PE headers for stealth
         if (headerSize > 0)
             b.EraseMemory(moduleBase, headerSize);
 
-        // Restore CPU state
+        // Restore state and return to original execution
         b.Add_Rsp(0x20)
-         .Fxrstor64()
+         .Xrstor64()
          .Mov_Rsp_Rbp()
          .Pop_AllGpr()
          .Popfq();
 
-        // Return to original execution
         if (originalRip == 0)
             b.Ret();
         else
@@ -1010,17 +1010,20 @@ public static partial class ManualMapper
     #region Stub Builder
 
     /// <summary>
-    /// Fluent x64 assembly code builder for generating stubs.
+    /// Fluent x64 machine code builder for generating shellcode stubs.
+    /// Provides type-safe methods for common x64 instructions used in injection stubs.
     /// </summary>
     private sealed class StubBuilder
     {
         private readonly List<byte> _code = [];
 
+        /// <summary>Returns the assembled machine code.</summary>
         public byte[] Build() => [.. _code];
 
         private StubBuilder Emit(params byte[] bytes) { _code.AddRange(bytes); return this; }
 
-        // Stack operations
+        #region Stack Operations
+
         public StubBuilder Sub_Rsp(byte imm) => Emit(0x48, 0x83, 0xEC, imm);
         public StubBuilder Sub_Rsp_Imm32(uint imm) => Emit(0x48, 0x81, 0xEC).Emit(BitConverter.GetBytes(imm));
         public StubBuilder Add_Rsp(byte imm) => Emit(0x48, 0x83, 0xC4, imm);
@@ -1030,23 +1033,72 @@ public static partial class ManualMapper
         public StubBuilder Cld() => Emit(0xFC);
         public StubBuilder Ret() => Emit(0xC3);
 
-        // Register save/restore
+        #endregion
+
+        #region GPR Save/Restore
+
+        /// <summary>Pushes RAX, RCX, RDX, RBX, RBP, RSI, RDI, R8-R15.</summary>
         public StubBuilder Push_AllGpr() => Emit(0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57)
             .Emit(0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57);
 
+        /// <summary>Pops R15-R8, RDI, RSI, RBP, RBX, RDX, RCX, RAX.</summary>
         public StubBuilder Pop_AllGpr() => Emit(0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58)
             .Emit(0x5F, 0x5E, 0x5D, 0x5B, 0x5A, 0x59, 0x58);
 
-        // FPU/SSE state
+        #endregion
+
+        #region Extended State (XSAVE/FXSAVE)
+
+        /// <summary>
+        /// Saves x87/SSE/AVX/AVX-512 state using XSAVE64.
+        /// Uses XGETBV to read XCR0 for the feature mask, ensuring all OS-enabled features are saved.
+        /// Requires 64-byte aligned RSP and pre-zeroed header at [RSP+512].
+        /// </summary>
+        public StubBuilder Xsave64() =>
+            Emit(0x31, 0xC9)                        // xor ecx, ecx
+            .Emit(0x0F, 0x01, 0xD0)                 // xgetbv
+            .Emit(0x48, 0x0F, 0xAE, 0x24, 0x24);    // xsave64 [rsp]
+
+        /// <summary>
+        /// Restores x87/SSE/AVX/AVX-512 state using XRSTOR64.
+        /// Uses XGETBV to read XCR0 for the feature mask.
+        /// </summary>
+        public StubBuilder Xrstor64() =>
+            Emit(0x31, 0xC9)                        // xor ecx, ecx
+            .Emit(0x0F, 0x01, 0xD0)                 // xgetbv
+            .Emit(0x48, 0x0F, 0xAE, 0x2C, 0x24);    // xrstor64 [rsp]
+
+        /// <summary>Saves x87/SSE state only (no AVX). Requires 16-byte aligned RSP.</summary>
         public StubBuilder Fxsave64() => Emit(0x48, 0x0F, 0xAE, 0x04, 0x24);
+
+        /// <summary>Restores x87/SSE state only (no AVX).</summary>
         public StubBuilder Fxrstor64() => Emit(0x48, 0x0F, 0xAE, 0x0C, 0x24);
 
-        // Stack frame
+        /// <summary>
+        /// Zeros the XSAVE header at [RSP+512] (64 bytes).
+        /// Must be called before XSAVE to prevent XRSTOR from reading garbage in XSTATE_BV.
+        /// Clobbers RAX, RCX, RDI (restored by Pop_AllGpr).
+        /// </summary>
+        public StubBuilder ZeroXsaveHeader() =>
+            Emit(0x48, 0x8D, 0xBC, 0x24, 0x00, 0x02, 0x00, 0x00)  // lea rdi, [rsp+512]
+            .Emit(0x31, 0xC0)                                      // xor eax, eax
+            .Emit(0xB9, 0x08, 0x00, 0x00, 0x00)                    // mov ecx, 8
+            .Emit(0xF3, 0x48, 0xAB);                               // rep stosq
+
+        #endregion
+
+        #region Stack Frame
+
         public StubBuilder Mov_Rbp_Rsp() => Emit(0x48, 0x89, 0xE5);
         public StubBuilder Mov_Rsp_Rbp() => Emit(0x48, 0x89, 0xEC);
         public StubBuilder And_Rsp_Align16() => Emit(0x48, 0x83, 0xE4, 0xF0);
+        public StubBuilder And_Rsp_Align64() => Emit(0x48, 0x83, 0xE4, 0xC0);
 
-        // Move immediate to register
+        #endregion
+
+        #region Register Operations
+
+        /// <summary>Moves 64-bit immediate to register (0=RAX, 1=RCX, ..., 8=R8, etc).</summary>
         public StubBuilder Mov_Reg_Imm64(byte reg, ulong imm)
         {
             byte prefix = reg < 8 ? (byte)0x48 : (byte)0x49;
@@ -1056,53 +1108,59 @@ public static partial class ManualMapper
 
         public StubBuilder Mov_Edx_Imm32(uint imm) => Emit(0xBA).Emit(BitConverter.GetBytes(imm));
         public StubBuilder Mov_Dl(byte imm) => Emit(0xB2, imm);
-
-        // Register operations
         public StubBuilder Xor_R8_R8() => Emit(0x41, 0x31, 0xC0);
         public StubBuilder Cmp_Rcx_Rax() => Emit(0x48, 0x39, 0xC1);
+        public StubBuilder Mov_Ptr_Rcx_Rdx() => Emit(0x48, 0x89, 0x11);
 
-        // Calls and jumps
+        #endregion
+
+        #region Control Flow
+
         public StubBuilder Call_Rax() => Emit(0xFF, 0xD0);
         public StubBuilder Call_R10() => Emit(0x41, 0xFF, 0xD2);
         public StubBuilder Jmp_Rax() => Emit(0xFF, 0xE0);
         public StubBuilder Jb(byte offset) => Emit(0x72, offset);
         public StubBuilder Jae(byte offset) => Emit(0x73, offset);
-
         public StubBuilder Jmp_Indirect(ulong addr) => Emit(0xFF, 0x25, 0x00, 0x00, 0x00, 0x00).Emit(BitConverter.GetBytes(addr));
 
-        // Memory operations
-        public StubBuilder Mov_Ptr_Rcx_Rdx() => Emit(0x48, 0x89, 0x11);  // mov [rcx], rdx
+        #endregion
 
-        // Debug marker
+        #region Debug Markers
+
+        /// <summary>Writes a 64-bit debug marker value to the specified address.</summary>
         public StubBuilder WriteDebugMarker(ulong markerAddr, ulong value) =>
             Mov_Reg_Imm64(0, markerAddr).Mov_Reg_Imm64(1, value).Emit(0x48, 0x89, 0x08);
 
-        // Write LdrpHandleTlsData result to debug marker
+        /// <summary>Writes LdrpHandleTlsData return value with 0x5555 prefix to debug marker.</summary>
         public StubBuilder WriteTlsResultMarker(ulong markerAddr) =>
             Mov_Reg_Imm64(1, markerAddr)
-            .Emit(0x89, 0xC0)  // mov eax, eax (zero-extend)
-            .Emit(0x48, 0xC7, 0xC2, 0x55, 0x55, 0x00, 0x00)  // mov rdx, 0x5555
-            .Emit(0x48, 0xC1, 0xE2, 0x20)  // shl rdx, 32
-            .Emit(0x48, 0x09, 0xC2)  // or rdx, rax
+            .Emit(0x89, 0xC0)                                     // mov eax, eax
+            .Emit(0x48, 0xC7, 0xC2, 0x55, 0x55, 0x00, 0x00)       // mov rdx, 0x5555
+            .Emit(0x48, 0xC1, 0xE2, 0x20)                         // shl rdx, 32
+            .Emit(0x48, 0x09, 0xC2)                               // or rdx, rax
             .Mov_Ptr_Rcx_Rdx();
 
-        // TLS callbacks loop
+        #endregion
+
+        #region High-Level Operations
+
+        /// <summary>Generates a loop that calls each TLS callback in a null-terminated array.</summary>
         public StubBuilder CallTlsCallbacks(ulong callbacksAddr, ulong moduleBase, ulong debugMarker)
         {
-            Mov_Reg_Imm64(3, callbacksAddr);  // rbx = callbacks array
+            Mov_Reg_Imm64(3, callbacksAddr);
 
             int loopStart = _code.Count;
             Emit(0x48, 0x8B, 0x03);  // mov rax, [rbx]
             Emit(0x48, 0x85, 0xC0);  // test rax, rax
-            Emit(0x74);  // jz exit
+            Emit(0x74);
             int jzPos = _code.Count; Emit(0x00);
 
             Mov_Reg_Imm64(1, moduleBase);
-            Mov_Edx_Imm32(2);  // DLL_THREAD_ATTACH
+            Mov_Edx_Imm32(2);
             Xor_R8_R8();
             Call_Rax();
 
-            Emit(0x48, 0x83, 0xC3, 0x08);  // add rbx, 8
+            Emit(0x48, 0x83, 0xC3, 0x08);
             int jumpBack = loopStart - (_code.Count + 2);
             Emit(0xEB, (byte)jumpBack);
 
@@ -1114,12 +1172,14 @@ public static partial class ManualMapper
             return this;
         }
 
-        // Erase memory (rep stosb)
+        /// <summary>Zeros memory at the specified address using rep stosb.</summary>
         public StubBuilder EraseMemory(ulong addr, uint size) =>
             Mov_Reg_Imm64(7, addr)
             .Emit(0xB9).Emit(BitConverter.GetBytes(size))
-            .Emit(0x31, 0xC0)  // xor eax, eax
-            .Emit(0xF3, 0xAA); // rep stosb
+            .Emit(0x31, 0xC0)
+            .Emit(0xF3, 0xAA);
+
+        #endregion
     }
 
     #endregion
