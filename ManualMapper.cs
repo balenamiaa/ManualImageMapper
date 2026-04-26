@@ -53,6 +53,10 @@ public static partial class ManualMapper
 
         try
         {
+            if (!IsProcess64Bit(hProcess))
+                throw new InvalidOperationException(
+                    $"Target process {pid} is 32-bit; only x64 targets are supported.");
+
             Log.Debug("Allocating {Size} bytes in target", nt.OptionalHeader.SizeOfImage);
             remoteBase = AllocateMemory(hProcess, nt.OptionalHeader.SizeOfImage);
 
@@ -159,9 +163,21 @@ public static partial class ManualMapper
         Log.Information("Using CreateRemoteThread (timeout: {TimeoutMs}ms)", config.TimeoutMs);
 
         var dllMain = remoteBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
+
+        // Collect TLS callbacks so they run before DllMain (same as hijack path)
+        var callbacks = CollectTlsCallbacks(hProcess, remoteBase, nt);
+        nint callbacksRemote = nint.Zero;
+        if (callbacks.Count > 0)
+        {
+            var cbBytes = callbacks.SelectMany(BitConverter.GetBytes).Concat(new byte[8]).ToArray();
+            callbacksRemote = AllocateMemory(hProcess, (uint)cbBytes.Length, PAGE_READWRITE);
+            WriteMemory(hProcess, callbacksRemote, cbBytes);
+        }
+
         var wrapper = BuildDllMainWrapper(
             hProcess, (ulong)dllMain, (ulong)remoteBase, nt.OptionalHeader.SizeOfHeaders,
-            (ulong)dotnetMainAddr, (ulong)ldrpHandleTlsDataAddr, (ulong)remoteLdrEntry);
+            (ulong)dotnetMainAddr, (ulong)ldrpHandleTlsDataAddr, (ulong)remoteLdrEntry,
+            (ulong)callbacksRemote);
 
         try
         {
@@ -177,6 +193,7 @@ public static partial class ManualMapper
         finally
         {
             FreeMemory(hProcess, wrapper);
+            if (callbacksRemote != nint.Zero) FreeMemory(hProcess, callbacksRemote);
         }
     }
 
@@ -479,9 +496,27 @@ public static partial class ManualMapper
     /// <summary>
     /// Hooks PalGetModuleHandleFromPointer to return our module base for pointers within our module.
     /// NativeAOT calls GetModuleHandleExW which fails for manually mapped modules.
+    ///
+    /// Layout of the hook (offsets from start of trampoline):
+    /// <code>
+    ///   0:  mov rax, moduleBase            ; 10 bytes
+    ///   10: cmp rcx, rax                   ;  3 bytes
+    ///   13: jb +26 -> original (offset 41) ;  2 bytes
+    ///   15: mov rax, moduleEnd             ; 10 bytes
+    ///   25: cmp rcx, rax                   ;  3 bytes
+    ///   28: jae +11 -> original            ;  2 bytes
+    ///   30: mov rax, moduleBase            ; 10 bytes (in-range: return moduleBase)
+    ///   40: ret                            ;  1 byte
+    ///   41: &lt;stolen prologue, 17 bytes&gt;  ; copied from original function
+    ///   58: jmp [rip+0]; funcAddr+17       ; 14 bytes (resume after stolen)
+    /// </code>
+    /// The original function's first 14 bytes are overwritten with an absolute jmp to the
+    /// trampoline. Because the stolen prologue is 17 bytes (3 instruction boundary past 14),
+    /// the trampoline copies all 17 bytes and resumes at funcAddr+17.
     /// </summary>
     private static void PatchNativeAotModuleLookup(nint hProcess, nint remoteBase, byte[] dll, uint sizeOfImage)
     {
+        const int stolenSize = 17;
         byte[] pattern = [0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xD1, 0x4C, 0x8D, 0x44, 0x24, 0x38, 0xB9, 0x05, 0x00, 0x00, 0x00];
 
         int rva = FindPattern(dll, pattern);
@@ -490,24 +525,27 @@ public static partial class ManualMapper
         var funcAddr = remoteBase + rva;
         ulong moduleEnd = (ulong)remoteBase + sizeOfImage;
 
-        // Hook: check if pointer is in our range, return moduleBase if yes, else call original
+        // Stolen prologue is position-independent (sub/mov-reg-reg/lea sib/mov-imm32) - safe to relocate.
+        byte[] stolenPrologue = dll.AsSpan(rva, stolenSize).ToArray();
+
         var hook = new StubBuilder()
-            .Mov_Reg_Imm64(0, (ulong)remoteBase)  // rax = moduleBase
-            .Cmp_Rcx_Rax()                         // if (ptr < moduleBase)
-            .Jb(23)                                //   goto original
-            .Mov_Reg_Imm64(0, moduleEnd)          // rax = moduleEnd
-            .Cmp_Rcx_Rax()                         // if (ptr >= moduleEnd)
-            .Jae(11)                               //   goto original
-            .Mov_Reg_Imm64(0, (ulong)remoteBase)  // return moduleBase
-            .Ret()
-            .Jmp_Indirect((ulong)funcAddr + 14)   // original: jmp to funcAddr+14
+            .Mov_Reg_Imm64(0, (ulong)remoteBase)        // 0:  rax = moduleBase
+            .Cmp_Rcx_Rax()                               // 10: cmp rcx, rax
+            .Jb(26)                                      // 13: ptr < base -> original at 41
+            .Mov_Reg_Imm64(0, moduleEnd)                // 15: rax = moduleEnd
+            .Cmp_Rcx_Rax()                               // 25: cmp rcx, rax
+            .Jae(11)                                     // 28: ptr >= end -> original at 41
+            .Mov_Reg_Imm64(0, (ulong)remoteBase)        // 30: rax = moduleBase (in-range)
+            .Ret()                                       // 40: return moduleBase
+            .Raw(stolenPrologue)                         // 41: original branch - stolen bytes
+            .Jmp_Indirect((ulong)funcAddr + stolenSize) // 58: resume after prologue
             .Build();
 
         var hookAddr = AllocateMemory(hProcess, (uint)hook.Length, PAGE_EXECUTE_READWRITE);
         WriteMemory(hProcess, hookAddr, hook);
         ProtectMemory(hProcess, hookAddr, (uint)hook.Length, PAGE_EXECUTE_READ);
 
-        // Patch original function to jump to hook
+        // Patch original function: 14-byte absolute indirect jmp to hook.
         var patch = new byte[14];
         patch[0] = 0xFF; patch[1] = 0x25; // jmp [rip+0]
         BitConverter.GetBytes((ulong)hookAddr).CopyTo(patch, 6);
@@ -554,12 +592,6 @@ public static partial class ManualMapper
         int pid, nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt,
         InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint ldrEntryAddr)
     {
-        if (!IsProcess64Bit(hProcess))
-        {
-            Log.Warning("Target is 32-bit - thread hijacking requires x64");
-            return nint.Zero;
-        }
-
         if (config.EnableDebugPrivilege)
             EnableSeDebugPrivilege();
 
@@ -792,7 +824,8 @@ public static partial class ManualMapper
 
     private static nint BuildDllMainWrapper(
         nint hProcess, ulong dllMain, ulong moduleBase, uint headerSize,
-        ulong dotnetMain, ulong ldrpHandleTlsData, ulong ldrEntry)
+        ulong dotnetMain, ulong ldrpHandleTlsData, ulong ldrEntry,
+        ulong callbacksAddr = 0)
     {
         var b = new StubBuilder().Sub_Rsp(0x28);
 
@@ -804,6 +837,10 @@ public static partial class ManualMapper
              .Mov_Reg_Imm64(0, ldrpHandleTlsData)
              .Call_Rax();
         }
+
+        // Call TLS callbacks before DllMain (mirrors what the loader does)
+        if (callbacksAddr != 0)
+            b.CallTlsCallbacks(callbacksAddr, moduleBase, debugMarker: 0);
 
         // Call DllMain
         b.Mov_Reg_Imm64(1, moduleBase)
@@ -1019,6 +1056,9 @@ public static partial class ManualMapper
 
         /// <summary>Returns the assembled machine code.</summary>
         public byte[] Build() => [.. _code];
+
+        /// <summary>Append raw bytes (e.g. a stolen prologue copied verbatim into a trampoline).</summary>
+        public StubBuilder Raw(byte[] bytes) => Emit(bytes);
 
         private StubBuilder Emit(params byte[] bytes) { _code.AddRange(bytes); return this; }
 
