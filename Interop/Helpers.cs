@@ -32,7 +32,7 @@ public static class MemoryHelpers
     /// <exception cref="System.ComponentModel.Win32Exception">If OpenProcess fails.</exception>
     public static nint OpenTargetProcess(int pid)
     {
-        var handle = NativeMethods.OpenProcess(Constants.PROCESS_ALL_ACCESS, false, pid);
+        var handle = NativeMethods.OpenProcess(Constants.PROCESS_INJECT_ACCESS, false, pid);
         if (handle == nint.Zero)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), $"OpenProcess failed for PID {pid}");
         Log.Debug("Opened process {Pid} -> 0x{Handle:X}", pid, (ulong)handle);

@@ -16,7 +16,7 @@ var cmdArgs = Environment.GetCommandLineArgs();
 if (cmdArgs.Length < 3 || cmdArgs.Length > 4)
 {
     logger.Information("Usage: {Usage} <dll path> <process name or pid> [method]", Path.GetFileName(cmdArgs[0]));
-    logger.Information("  method: 'hijack' (default), 'hijack-debug' (with diagnostics), or 'thread' for CreateRemoteThread");
+    logger.Information("  method: 'hijack' (default, stealth), 'hijack-debug' (verbose stub diagnostics), or 'thread' for CreateRemoteThread");
     return;
 }
 
@@ -26,10 +26,10 @@ string method = cmdArgs.Length > 3 ? cmdArgs[3].ToLowerInvariant() : "hijack";
 
 InjectionMode injectionMode = method switch
 {
-    "hijack" or "h" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: false, LogGeneratedStub: false),
-    "hijack-debug" or "hd" => new InjectionMode.ThreadHijacking(TimeSpan.FromSeconds(1), EnableDebugMarker: true, LogGeneratedStub: true),
+    "hijack" or "h" => new InjectionMode.ThreadHijacking(),
+    "hijack-debug" or "hd" => new InjectionMode.ThreadHijacking(LogStubBytes: true),
     "thread" or "t" => new InjectionMode.CreateRemoteThread(),
-    _ => throw new ArgumentException($"Invalid method '{cmdArgs[3]}'. Use 'hijack', 'hijack-debug', or 'thread'.")
+    _ => throw new ArgumentException($"Invalid method '{method}'. Use 'hijack', 'hijack-debug', or 'thread'.")
 };
 
 if (!File.Exists(dllPath))
@@ -84,9 +84,10 @@ try
         _ => injectionMode.GetType().Name
     };
 
+    var dllFileName = Path.GetFileName(dllPath);
     logger.Information("Injecting {Dll} into PID {Pid} using {Method}",
-        Path.GetFileName(dllPath), validPid, methodName);
-    ManualMapper.Inject(dllBytes, validPid, injectionMode);
+        dllFileName, validPid, methodName);
+    ManualMapper.Inject(dllBytes, validPid, injectionMode, dllFileName);
     logger.Information("Injection completed successfully");
 }
 catch (Exception ex)

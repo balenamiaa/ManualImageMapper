@@ -30,6 +30,10 @@ public static class Constants
     /// <summary>Written after DotnetMain returns successfully.</summary>
     public const ulong DEBUG_MARKER_POST_DOTNETMAIN = 0x4444444444444444;
 
+    /// <summary>Final completion sentinel - written by hijack stub right before CPU state restoration.
+    /// Host polls this for synchronization; only safe to free target-side allocations after seeing it.</summary>
+    public const ulong SYNC_MARKER_DONE = 0xC0DEC0DEC0DEC0DE;
+
     // =========================================================================
     // PE FORMAT CONSTANTS
     // Magic numbers and flags from the PE specification.
@@ -55,6 +59,22 @@ public static class Constants
     // =========================================================================
 
     public const uint PROCESS_ALL_ACCESS = 0x001F0FFF;
+
+    public const uint PROCESS_CREATE_THREAD = 0x0002;
+    public const uint PROCESS_VM_OPERATION = 0x0008;
+    public const uint PROCESS_VM_READ = 0x0010;
+    public const uint PROCESS_VM_WRITE = 0x0020;
+    public const uint PROCESS_DUP_HANDLE = 0x0040;
+    public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+
+    /// <summary>Minimum access rights needed for manual mapping. Less detectable than PROCESS_ALL_ACCESS.</summary>
+    public const uint PROCESS_INJECT_ACCESS =
+        PROCESS_CREATE_THREAD |
+        PROCESS_VM_OPERATION |
+        PROCESS_VM_READ |
+        PROCESS_VM_WRITE |
+        PROCESS_DUP_HANDLE |
+        PROCESS_QUERY_INFORMATION;
 
     // =========================================================================
     // MEMORY ALLOCATION
