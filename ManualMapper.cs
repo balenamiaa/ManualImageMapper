@@ -15,13 +15,17 @@ public abstract record InjectionMode
 {
     /// <summary>
     /// Thread hijacking mode: suspends an existing thread, redirects RIP to our stub,
-    /// then resumes. More stealthy as no new thread is created.
+    /// then resumes. More stealthy as no new thread is created. The host polls a
+    /// completion sentinel to know when the stub finished, then erases + frees all
+    /// target-side allocations (stub, TLS callbacks, marker, LDR entry).
     /// </summary>
+    /// <param name="WaitTimeout">Max time to poll for stub completion. <see cref="TimeSpan.Zero"/> uses the 5s default.</param>
+    /// <param name="EnableDebugPrivilege">Acquire SeDebugPrivilege before opening protected processes.</param>
+    /// <param name="LogStubBytes">Hex-dump generated shellcode for diagnostics.</param>
     public sealed record ThreadHijacking(
-        TimeSpan DebugMarkerCheckDelay,
+        TimeSpan WaitTimeout = default,
         bool EnableDebugPrivilege = true,
-        bool EnableDebugMarker = false,
-        bool LogGeneratedStub = false) : InjectionMode;
+        bool LogStubBytes = false) : InjectionMode;
 
     /// <summary>
     /// CreateRemoteThread mode: spawns a new thread to execute the loader stub.
@@ -39,16 +43,41 @@ public static partial class ManualMapper
     private static readonly ILogger Log = Serilog.Log.ForContext("SourceContext", nameof(ManualMapper));
 
     /// <summary>
+    /// Pair of <c>LdrLockLoaderLock</c> / <c>LdrUnlockLoaderLock</c> addresses.
+    /// Both are exported by ntdll.dll and reside at the same address in every process
+    /// in a session, so locally-resolved values are valid in any target.
+    /// </summary>
+    private readonly record struct LoaderLockFns(nint Lock, nint Unlock);
+
+    private static LoaderLockFns ResolveLoaderLockFns()
+    {
+        var ntdll = GetModuleHandle("ntdll.dll");
+        if (ntdll == nint.Zero)
+            throw new InvalidOperationException("ntdll.dll not loaded in current process - cannot resolve loader lock APIs");
+
+        var lockFn = GetProcAddress(ntdll, "LdrLockLoaderLock");
+        var unlockFn = GetProcAddress(ntdll, "LdrUnlockLoaderLock");
+        if (lockFn == nint.Zero || unlockFn == nint.Zero)
+            throw new InvalidOperationException("ntdll!Ldr{Lock,Unlock}LoaderLock not found");
+
+        return new LoaderLockFns(lockFn, unlockFn);
+    }
+
+    /// <summary>
     /// Injects a DLL into the target process using manual mapping.
     /// </summary>
-    public static void Inject(byte[] dllBytes, int pid, InjectionMode mode)
+    public static void Inject(byte[] dllBytes, int pid, InjectionMode mode, string? dllName = null)
     {
         var nt = GetNtHeaders(dllBytes);
         var sections = GetSectionHeaders(dllBytes);
+        dllName ??= "injected.dll";
+
+        var loaderFns = ResolveLoaderLockFns();
 
         Log.Information("Opening target process {Pid}", pid);
         var hProcess = OpenTargetProcess(pid);
         nint remoteBase = nint.Zero;
+        LdrStructures ldrStructures = LdrStructures.Empty;
         bool dllMainExecuted = false;
 
         try
@@ -81,17 +110,15 @@ public static partial class ManualMapper
             SetSectionProtections(hProcess, remoteBase, sections);
 
             var dllEntryPoint = remoteBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
-            var dllName = Path.GetFileName(
-                Environment.GetCommandLineArgs().ElementAtOrDefault(1) ?? "injected.dll");
 
-            // Link to PEB for CRT support; LdrpHandleTlsData will be called from the stub
-            Log.Debug("Linking module to PEB");
-            var (remoteLdrEntry, ldrpHandleTlsDataAddr) = InitializeCrtModulePebOnly(
+            Log.Debug("Building LDR entry (stub will link/unlink under loader lock)");
+            nint ldrpHandleTlsDataAddr;
+            (ldrStructures, ldrpHandleTlsDataAddr) = InitializeCrtModulePebOnly(
                 hProcess, pid, remoteBase, nt.OptionalHeader.SizeOfImage,
                 dllEntryPoint, nt.OptionalHeader.ImageBase, dllName);
 
-            if (remoteLdrEntry != nint.Zero)
-                Log.Debug("PEB linked - LDR entry: 0x{Entry:X}", (ulong)remoteLdrEntry);
+            if (!ldrStructures.IsEmpty)
+                Log.Debug("LDR entry built - addr: 0x{Entry:X}", (ulong)ldrStructures.Allocations.LdrEntry);
 
             // Patch NativeAOT's PalGetModuleHandleFromPointer to handle our unmapped module
             PatchNativeAotModuleLookup(hProcess, remoteBase, dllBytes, nt.OptionalHeader.SizeOfImage);
@@ -105,124 +132,170 @@ public static partial class ManualMapper
             dllMainExecuted = mode switch
             {
                 InjectionMode.ThreadHijacking hijack => ExecuteViaThreadHijacking(
-                    hProcess, pid, remoteBase, nt, hijack, dotnetMainAddr, ldrpHandleTlsDataAddr, remoteLdrEntry),
+                    hProcess, pid, remoteBase, nt, hijack, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns),
 
                 InjectionMode.CreateRemoteThread crt => ExecuteViaRemoteThread(
-                    hProcess, remoteBase, nt, crt, dotnetMainAddr, ldrpHandleTlsDataAddr, remoteLdrEntry),
+                    hProcess, remoteBase, nt, crt, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns),
 
                 _ => throw new ArgumentException($"Unsupported injection mode: {mode.GetType().Name}")
             };
 
-            Log.Debug("Unlinking module from PEB");
-            UnlinkFromPEB(hProcess, remoteBase);
+            if (dllMainExecuted)
+            {
+                // Stub already unlinked under loader lock - just free the allocations.
+                Log.Debug("Freeing PEB allocations");
+                FreePebLinkAllocations(hProcess, ldrStructures.Allocations);
+                ldrStructures = LdrStructures.Empty;
+            }
+            else
+            {
+                Log.Warning("DllMain did not signal completion - leaking allocations to avoid corrupting in-flight stub");
+            }
         }
         catch
         {
-            if (!dllMainExecuted && remoteBase != nint.Zero)
+            if (!dllMainExecuted)
             {
                 Log.Debug("Freeing remote memory due to injection failure");
-                try { FreeMemory(hProcess, remoteBase); } catch { }
+                if (remoteBase != nint.Zero) try { FreeMemory(hProcess, remoteBase); } catch { }
+                try { FreePebLinkAllocations(hProcess, ldrStructures.Allocations); } catch { }
             }
             throw;
         }
         finally
         {
-            Log.Information("Injection complete");
+            if (dllMainExecuted)
+                Log.Information("Injection complete");
+            else
+                Log.Warning("Injection did not complete successfully");
             CloseHandleSafe(hProcess);
         }
     }
 
     private static bool ExecuteViaThreadHijacking(
         nint hProcess, int pid, nint remoteBase, IMAGE_NT_HEADERS64 nt,
-        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint remoteLdrEntry)
+        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
-        Log.Information("Using thread hijacking");
+        var timeout = config.WaitTimeout > TimeSpan.Zero ? config.WaitTimeout : TimeSpan.FromSeconds(5);
+        Log.Information("Using thread hijacking (timeout: {Timeout})", timeout);
 
-        var debugMarker = HijackFirstThread(
-            pid, hProcess, remoteBase, nt, config, dotnetMainAddr, ldrpHandleTlsDataAddr, remoteLdrEntry);
+        var stubInfo = HijackFirstThread(
+            pid, hProcess, remoteBase, nt, config, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns);
 
-        if (config.EnableDebugMarker)
+        var completed = WaitForCompletion(hProcess, stubInfo.MarkerAddr, timeout, out var lastValue);
+
+        if (!completed)
         {
-            if (debugMarker == nint.Zero)
-            {
-                Log.Warning("Failed to hijack thread");
-                return false;
-            }
-
-            Thread.Sleep(config.DebugMarkerCheckDelay);
-            LogDebugMarkerStatus(hProcess, debugMarker);
+            Log.Warning("Hijack stub did not signal completion in {Timeout} (last stage: {Stage}); leaking allocations to avoid corrupting in-flight stub",
+                timeout, FormatStage(lastValue));
+            return false;
         }
+
+        Log.Debug("Hijack stub signaled completion; final stage: {Stage}", FormatStage(lastValue));
+
+        // Grace period: stub still has ~50 bytes of register restoration + RIP-relative jmp
+        // to execute after writing the marker. 50ms is six orders of magnitude more than needed.
+        Thread.Sleep(50);
+
+        Log.Debug("Cleaning up target-side allocations");
+        EraseAndFree(hProcess, stubInfo.StubAddr, stubInfo.StubLen);
+        if (stubInfo.CallbacksAddr != nint.Zero)
+            EraseAndFree(hProcess, stubInfo.CallbacksAddr, stubInfo.CallbacksLen);
+        TryFreeRemote(hProcess, stubInfo.MarkerAddr);
 
         return true;
     }
 
     private static bool ExecuteViaRemoteThread(
         nint hProcess, nint remoteBase, IMAGE_NT_HEADERS64 nt,
-        InjectionMode.CreateRemoteThread config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint remoteLdrEntry)
+        InjectionMode.CreateRemoteThread config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
         Log.Information("Using CreateRemoteThread (timeout: {TimeoutMs}ms)", config.TimeoutMs);
 
-        var dllMain = remoteBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
-
-        // Collect TLS callbacks so they run before DllMain (same as hijack path)
-        var callbacks = CollectTlsCallbacks(hProcess, remoteBase, nt);
-        nint callbacksRemote = nint.Zero;
-        if (callbacks.Count > 0)
-        {
-            var cbBytes = callbacks.SelectMany(BitConverter.GetBytes).Concat(new byte[8]).ToArray();
-            callbacksRemote = AllocateMemory(hProcess, (uint)cbBytes.Length, PAGE_READWRITE);
-            WriteMemory(hProcess, callbacksRemote, cbBytes);
-        }
-
-        var wrapper = BuildDllMainWrapper(
-            hProcess, (ulong)dllMain, (ulong)remoteBase, nt.OptionalHeader.SizeOfHeaders,
-            (ulong)dotnetMainAddr, (ulong)ldrpHandleTlsDataAddr, (ulong)remoteLdrEntry,
-            (ulong)callbacksRemote);
+        var (wrapper, wrapperLen, callbacksAddr, callbacksLen) = BuildDllMainWrapper(
+            hProcess, remoteBase, nt, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns);
 
         try
         {
             var hThread = CreateRemoteThreadAndWait(hProcess, wrapper, nint.Zero, wait: false);
-            if (hThread != nint.Zero)
-            {
-                WaitForSingleObject(hThread, config.TimeoutMs);
-                CloseHandleSafe(hThread);
-                return true;
-            }
-            return false;
+            if (hThread == nint.Zero) return false;
+
+            WaitForSingleObject(hThread, config.TimeoutMs);
+            CloseHandleSafe(hThread);
+            return true;
         }
         finally
         {
-            FreeMemory(hProcess, wrapper);
-            if (callbacksRemote != nint.Zero) FreeMemory(hProcess, callbacksRemote);
+            EraseAndFree(hProcess, wrapper, wrapperLen);
+            if (callbacksAddr != nint.Zero)
+                EraseAndFree(hProcess, callbacksAddr, callbacksLen);
         }
     }
 
-    private static void LogDebugMarkerStatus(nint hProcess, nint debugMarker)
+    /// <summary>
+    /// Polls the sync marker in the target process for <see cref="SYNC_MARKER_DONE"/>.
+    /// </summary>
+    private static bool WaitForCompletion(nint hProcess, nint markerAddr, TimeSpan timeout, out ulong lastValue)
     {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        lastValue = DEBUG_MARKER_INITIAL;
+        while (Environment.TickCount64 < deadline)
+        {
+            try
+            {
+                lastValue = BitConverter.ToUInt64(ReadMemory(hProcess, markerAddr, 8));
+                if (lastValue == SYNC_MARKER_DONE) return true;
+            }
+            catch
+            {
+                // Transient read failure (e.g., target ASLR'd a page mid-poll); retry.
+            }
+            Thread.Sleep(5);
+        }
+        return false;
+    }
+
+    private static string FormatStage(ulong value) =>
+        (value >> 32) == 0x5555
+            ? $"LdrpHandleTlsData returned 0x{value & 0xFFFFFFFF:X8}"
+            : value switch
+            {
+                DEBUG_MARKER_INITIAL => "INITIAL (stub never ran)",
+                DEBUG_MARKER_ENTRY => "ENTRY",
+                DEBUG_MARKER_POST_TLS => "POST_TLS",
+                DEBUG_MARKER_PRE_DLLMAIN => "PRE_DLLMAIN",
+                DEBUG_MARKER_POST_DLLMAIN => "POST_DLLMAIN",
+                DEBUG_MARKER_POST_DOTNETMAIN => "POST_DOTNETMAIN",
+                SYNC_MARKER_DONE => "DONE",
+                _ => $"UNKNOWN (0x{value:X})"
+            };
+
+    /// <summary>
+    /// Zeros remote memory then frees it. Safe to call once the stub has signaled completion;
+    /// the zeroing scrubs shellcode bytes from any future memory dump of the target.
+    /// </summary>
+    private static void EraseAndFree(nint hProcess, nint addr, int len)
+    {
+        if (addr == nint.Zero || len <= 0) return;
         try
         {
-            var value = BitConverter.ToUInt64(ReadMemory(hProcess, debugMarker, 8));
-
-            var stage = (value >> 32) == 0x5555
-                ? $"LdrpHandleTlsData returned 0x{value & 0xFFFFFFFF:X8}"
-                : value switch
-                {
-                    DEBUG_MARKER_INITIAL => "INITIAL (stub never ran)",
-                    DEBUG_MARKER_ENTRY => "ENTRY",
-                    DEBUG_MARKER_POST_TLS => "POST_TLS",
-                    DEBUG_MARKER_PRE_DLLMAIN => "PRE_DLLMAIN",
-                    DEBUG_MARKER_POST_DLLMAIN => "POST_DLLMAIN",
-                    0x6666666666666666 => "PRE_DOTNETMAIN",
-                    DEBUG_MARKER_POST_DOTNETMAIN => "POST_DOTNETMAIN",
-                    _ => $"UNKNOWN (0x{value:X})"
-                };
-
-            Log.Information("Debug marker: {Stage}", stage);
+            ProtectMemory(hProcess, addr, (uint)len, PAGE_READWRITE);
+            WriteMemory(hProcess, addr, new byte[len]);
+            FreeMemory(hProcess, addr);
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to read debug marker");
+            Log.Verbose(ex, "EraseAndFree failed for 0x{Addr:X} ({Len})", (ulong)addr, len);
         }
+    }
+
+    private static void TryFreeRemote(nint hProcess, nint addr)
+    {
+        if (addr == nint.Zero) return;
+        try { FreeMemory(hProcess, addr); }
+        catch (Exception ex) { Log.Verbose(ex, "TryFreeRemote failed for 0x{Addr:X}", (ulong)addr); }
     }
 
     #region PE Operations
@@ -588,9 +661,19 @@ public static partial class ManualMapper
 
     #region Thread Hijacking
 
-    private static nint HijackFirstThread(
+    /// <summary>
+    /// Tracks every target-side allocation made for a hijack so the host can erase + free them
+    /// after the stub signals completion.
+    /// </summary>
+    private readonly record struct HijackStubInfo(
+        nint StubAddr, int StubLen,
+        nint CallbacksAddr, int CallbacksLen,
+        nint MarkerAddr);
+
+    private static HijackStubInfo HijackFirstThread(
         int pid, nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt,
-        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint ldrEntryAddr)
+        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
         if (config.EnableDebugPrivilege)
             EnableSeDebugPrivilege();
@@ -600,8 +683,8 @@ public static partial class ManualMapper
 
         return (active, blocked) switch
         {
-            ({ } t, _) => HijackThread(t, hProcess, moduleBase, nt, config, false, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrEntryAddr),
-            (_, { } t) => HijackThread(t, hProcess, moduleBase, nt, config, true, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrEntryAddr),
+            ({ } t, _) => HijackThread(t, hProcess, moduleBase, nt, config, false, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns),
+            (_, { } t) => HijackThread(t, hProcess, moduleBase, nt, config, true, dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns),
             _ => throw new InvalidOperationException("No suitable thread found")
         };
     }
@@ -642,21 +725,23 @@ public static partial class ManualMapper
         }
     }
 
-    private static nint HijackThread(
+    private static HijackStubInfo HijackThread(
         ThreadInfo thread, nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt,
         InjectionMode.ThreadHijacking config, bool needsWakeup,
-        nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint ldrEntryAddr)
+        nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
+        HijackStubInfo? built = null;
         try
         {
             if (!thread.TryGetContext(out var ctx))
                 throw new InvalidOperationException($"Failed to get context for thread {thread.Id}");
 
-            var (stubAddr, debugMarker) = BuildAndWriteLoaderStub(
+            built = BuildAndWriteLoaderStub(
                 hProcess, moduleBase, nt, (nint)ctx.Rip, config,
-                dotnetMainAddr, ldrpHandleTlsDataAddr, ldrEntryAddr);
+                dotnetMainAddr, ldrpHandleTlsDataAddr, ldrStructures, loaderFns);
 
-            ctx.Rip = (ulong)stubAddr;
+            ctx.Rip = (ulong)built.Value.StubAddr;
             if (!thread.TrySetContext(ctx))
                 throw new InvalidOperationException($"Failed to set context for thread {thread.Id}");
 
@@ -664,7 +749,18 @@ public static partial class ManualMapper
             if (needsWakeup) WakeThread(thread.Id, thread.Handle);
 
             Log.Debug("Hijacked thread {Tid}", thread.Id);
-            return debugMarker;
+            return built.Value;
+        }
+        catch
+        {
+            // Stub was allocated but RIP not redirected; safe to free.
+            if (built is { } info)
+            {
+                TryFreeRemote(hProcess, info.StubAddr);
+                if (info.CallbacksAddr != nint.Zero) TryFreeRemote(hProcess, info.CallbacksAddr);
+                TryFreeRemote(hProcess, info.MarkerAddr);
+            }
+            throw;
         }
         finally
         {
@@ -672,42 +768,43 @@ public static partial class ManualMapper
         }
     }
 
-    private static (nint stubAddr, nint debugMarker) BuildAndWriteLoaderStub(
+    private static HijackStubInfo BuildAndWriteLoaderStub(
         nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt, nint originalRip,
-        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr, nint ldrEntryAddr)
+        InjectionMode.ThreadHijacking config, nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
         var dllMain = moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint;
         var callbacks = CollectTlsCallbacks(hProcess, moduleBase, nt);
 
-        var callbacksRemote = nint.Zero;
+        nint callbacksRemote = nint.Zero;
+        int callbacksLen = 0;
         if (callbacks.Count > 0)
         {
             var cbBytes = callbacks.SelectMany(BitConverter.GetBytes).Concat(new byte[8]).ToArray();
-            callbacksRemote = AllocateMemory(hProcess, (uint)cbBytes.Length, PAGE_READWRITE);
+            callbacksLen = cbBytes.Length;
+            callbacksRemote = AllocateMemory(hProcess, (uint)callbacksLen, PAGE_READWRITE);
             WriteMemory(hProcess, callbacksRemote, cbBytes);
         }
 
-        nint debugMarker = nint.Zero;
-        if (config.EnableDebugMarker)
-        {
-            debugMarker = AllocateMemory(hProcess, 8, PAGE_READWRITE);
-            WriteMemory(hProcess, debugMarker, BitConverter.GetBytes(DEBUG_MARKER_INITIAL));
-        }
+        // Marker is always allocated - host polls it for sync, regardless of debug flags.
+        var marker = AllocateMemory(hProcess, 8, PAGE_READWRITE);
+        WriteMemory(hProcess, marker, BitConverter.GetBytes(DEBUG_MARKER_INITIAL));
 
         var stub = BuildHijackStub(
             (ulong)moduleBase, (ulong)dllMain, (ulong)callbacksRemote, (ulong)originalRip,
-            (ulong)debugMarker, nt.OptionalHeader.SizeOfHeaders,
-            (ulong)dotnetMainAddr, (ulong)ldrpHandleTlsDataAddr, (ulong)ldrEntryAddr);
+            (ulong)marker, nt.OptionalHeader.SizeOfHeaders,
+            (ulong)dotnetMainAddr, (ulong)ldrpHandleTlsDataAddr,
+            ldrStructures, loaderFns);
 
-        if (config.LogGeneratedStub)
-            Log.Information("Stub bytes: {Hex}", Convert.ToHexString(stub));
+        if (config.LogStubBytes)
+            Log.Information("Stub bytes ({Length}): {Hex}", stub.Length, Convert.ToHexString(stub));
 
-        var remote = AllocateMemory(hProcess, (uint)stub.Length, PAGE_READWRITE);
-        WriteMemory(hProcess, remote, stub);
-        ProtectMemory(hProcess, remote, (uint)stub.Length, PAGE_EXECUTE_READ);
-        FlushInstructionCache(hProcess, remote, (uint)stub.Length);
+        var stubAddr = AllocateMemory(hProcess, (uint)stub.Length, PAGE_READWRITE);
+        WriteMemory(hProcess, stubAddr, stub);
+        ProtectMemory(hProcess, stubAddr, (uint)stub.Length, PAGE_EXECUTE_READ);
+        FlushInstructionCache(hProcess, stubAddr, (uint)stub.Length);
 
-        return (remote, debugMarker);
+        return new HijackStubInfo(stubAddr, stub.Length, callbacksRemote, callbacksLen, marker);
     }
 
     private static List<ulong> CollectTlsCallbacks(nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt)
@@ -735,20 +832,27 @@ public static partial class ManualMapper
 
     /// <summary>
     /// Builds the thread hijacking stub that:
-    /// 1. Saves complete CPU state (GPRs, flags, x87/SSE/AVX via XSAVE)
-    /// 2. Initializes TLS via LdrpHandleTlsData
-    /// 3. Calls TLS callbacks and DllMain
-    /// 4. Optionally calls DotnetMain export
-    /// 5. Erases PE headers for stealth
-    /// 6. Restores CPU state and jumps back to original RIP
+    /// <list type="number">
+    /// <item>Saves complete CPU state (GPRs, flags, x87/SSE/AVX via XSAVE).</item>
+    /// <item>Acquires <c>LdrLockLoaderLock</c> so all PEB-list and loader-callable work runs under the same lock the OS loader holds.</item>
+    /// <item>Inserts the LDR entry into all three PEB module lists (load/memory/init order).</item>
+    /// <item>Calls <c>LdrpHandleTlsData</c> to initialize TLS, then runs TLS callbacks and DllMain.</item>
+    /// <item>Optionally calls DotnetMain export.</item>
+    /// <item>Removes the entry from all three PEB lists and releases the loader lock.</item>
+    /// <item>Erases PE headers for stealth.</item>
+    /// <item>Writes <see cref="SYNC_MARKER_DONE"/> so the host can free target-side allocations.</item>
+    /// <item>Restores CPU state and jumps back to original RIP.</item>
+    /// </list>
+    /// Stack layout after the prologue: [rsp+0x00..0x1F] shadow, [rsp+0x20] cookie, [rsp+0x28] state.
     /// </summary>
     private static byte[] BuildHijackStub(
         ulong moduleBase, ulong dllMain, ulong callbacksAddr, ulong originalRip,
-        ulong debugMarker, uint headerSize, ulong dotnetMain, ulong ldrpHandleTlsData, ulong ldrEntry)
+        ulong markerAddr, uint headerSize, ulong dotnetMain, ulong ldrpHandleTlsData,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
         var b = new StubBuilder();
 
-        // Save state: flags, GPRs, then XSAVE for FPU/SSE/AVX
+        // Save state: flags, GPRs, then XSAVE for FPU/SSE/AVX. Reserve 0x40 = shadow + locals.
         b.Pushfq().Cld()
          .Push_AllGpr()
          .Mov_Rbp_Rsp()
@@ -756,55 +860,60 @@ public static partial class ManualMapper
          .Sub_Rsp_Imm32(4096)
          .ZeroXsaveHeader()
          .Xsave64()
-         .Sub_Rsp(0x20);
+         .Sub_Rsp(0x40);
 
-        if (debugMarker != 0)
-            b.WriteDebugMarker(debugMarker, DEBUG_MARKER_ENTRY);
+        b.WriteDebugMarker(markerAddr, DEBUG_MARKER_ENTRY);
 
-        // TLS initialization via LdrpHandleTlsData
+        // LdrLockLoaderLock(0, &state at [rsp+0x28], &cookie at [rsp+0x20])
+        EmitLoaderLockAcquire(b, loaderFns.Lock);
+
+        // Insert into PEB's three module lists (held under loader lock - atomic w.r.t. target's loader)
+        EmitInsertIntoPebLists(b, ldrStructures);
+
+        // TLS initialization via LdrpHandleTlsData(ldrEntry, BOOLEAN=1)
+        var ldrEntry = (ulong)ldrStructures.Allocations.LdrEntry;
         if (ldrpHandleTlsData != 0 && ldrEntry != 0)
         {
             b.Mov_Reg_Imm64(1, ldrEntry)
              .Mov_Dl(1)
              .Mov_Reg_Imm64(0, ldrpHandleTlsData)
-             .Call_Rax();
-
-            if (debugMarker != 0)
-                b.WriteTlsResultMarker(debugMarker);
+             .Call_Rax()
+             .WriteTlsResultMarker(markerAddr);
         }
 
         if (callbacksAddr != 0)
-            b.CallTlsCallbacks(callbacksAddr, moduleBase, debugMarker);
+            b.CallTlsCallbacks(callbacksAddr, moduleBase, markerAddr);
 
-        if (debugMarker != 0)
-            b.WriteDebugMarker(debugMarker, DEBUG_MARKER_PRE_DLLMAIN);
+        b.WriteDebugMarker(markerAddr, DEBUG_MARKER_PRE_DLLMAIN);
 
-        // DllMain(moduleBase, DLL_PROCESS_ATTACH, NULL)
+        // DllMain(moduleBase, DLL_PROCESS_ATTACH, NULL) - mirrors how the loader normally calls it
         b.Mov_Reg_Imm64(1, moduleBase)
          .Mov_Edx_Imm32(1)
          .Xor_R8_R8()
          .Mov_Reg_Imm64(0, dllMain)
          .Call_Rax();
 
-        if (debugMarker != 0)
-            b.WriteDebugMarker(debugMarker, DEBUG_MARKER_POST_DLLMAIN);
+        b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_DLLMAIN);
 
         if (dotnetMain != 0)
         {
-            if (debugMarker != 0)
-                b.WriteDebugMarker(debugMarker, 0x6666666666666666);
-
             b.Mov_Reg_Imm64(0, dotnetMain).Call_Rax();
-
-            if (debugMarker != 0)
-                b.WriteDebugMarker(debugMarker, DEBUG_MARKER_POST_DOTNETMAIN);
+            b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_DOTNETMAIN);
         }
+
+        // Unlink from all three PEB lists, then release loader lock
+        EmitRemoveFromPebLists(b, ldrStructures);
+        EmitLoaderLockRelease(b, loaderFns.Unlock);
 
         if (headerSize > 0)
             b.EraseMemory(moduleBase, headerSize);
 
+        // Final sync sentinel - host polls this before cleaning up target-side allocations.
+        // Must be written *before* state restoration since we need RAX/RCX free to do the store.
+        b.WriteDebugMarker(markerAddr, SYNC_MARKER_DONE);
+
         // Restore state and return to original execution
-        b.Add_Rsp(0x20)
+        b.Add_Rsp(0x40)
          .Xrstor64()
          .Mov_Rsp_Rbp()
          .Pop_AllGpr()
@@ -818,53 +927,114 @@ public static partial class ManualMapper
         return b.Build();
     }
 
+    /// <summary>
+    /// Emit <c>LdrLockLoaderLock(0, &amp;state, &amp;cookie)</c> with state at [rsp+0x28] and cookie at [rsp+0x20].
+    /// </summary>
+    private static void EmitLoaderLockAcquire(StubBuilder b, nint lockFn)
+    {
+        b.Xor_Ecx_Ecx()
+         .Lea_Rdx_RspDisp8(0x28)
+         .Lea_R8_RspDisp8(0x20)
+         .Mov_Reg_Imm64(0, (ulong)lockFn)
+         .Call_Rax();
+    }
+
+    /// <summary>
+    /// Emit <c>LdrUnlockLoaderLock(0, cookie)</c> reading cookie from [rsp+0x20].
+    /// </summary>
+    private static void EmitLoaderLockRelease(StubBuilder b, nint unlockFn)
+    {
+        b.Xor_Ecx_Ecx()
+         .Mov_Rdx_QwordPtr_RspDisp8(0x20)
+         .Mov_Reg_Imm64(0, (ulong)unlockFn)
+         .Call_Rax();
+    }
+
+    private static void EmitInsertIntoPebLists(StubBuilder b, LdrStructures s)
+    {
+        b.InsertTailList((ulong)s.InLoadOrderHead, (ulong)s.InLoadOrderEntryAddr)
+         .InsertTailList((ulong)s.InMemoryOrderHead, (ulong)s.InMemoryOrderEntryAddr)
+         .InsertTailList((ulong)s.InInitializationOrderHead, (ulong)s.InInitializationOrderEntryAddr);
+    }
+
+    private static void EmitRemoveFromPebLists(StubBuilder b, LdrStructures s)
+    {
+        b.RemoveEntryList((ulong)s.InLoadOrderEntryAddr)
+         .RemoveEntryList((ulong)s.InMemoryOrderEntryAddr)
+         .RemoveEntryList((ulong)s.InInitializationOrderEntryAddr);
+    }
+
     #endregion
 
     #region CreateRemoteThread Wrapper
 
-    private static nint BuildDllMainWrapper(
-        nint hProcess, ulong dllMain, ulong moduleBase, uint headerSize,
-        ulong dotnetMain, ulong ldrpHandleTlsData, ulong ldrEntry,
-        ulong callbacksAddr = 0)
+    /// <summary>
+    /// Builds the CreateRemoteThread wrapper. Like the hijack stub it acquires the loader lock,
+    /// inserts the LDR entry into the PEB lists, runs TLS init + callbacks + DllMain + DotnetMain,
+    /// then removes the entry and releases the lock. Stack frame: 0x48 = 32 shadow + 16 locals
+    /// (cookie at [rsp+0x20], state at [rsp+0x28]).
+    /// </summary>
+    private static (nint stubAddr, int stubLen, nint callbacksAddr, int callbacksLen) BuildDllMainWrapper(
+        nint hProcess, nint moduleBase, IMAGE_NT_HEADERS64 nt,
+        nint dotnetMainAddr, nint ldrpHandleTlsDataAddr,
+        LdrStructures ldrStructures, LoaderLockFns loaderFns)
     {
-        var b = new StubBuilder().Sub_Rsp(0x28);
+        var dllMain = (ulong)(moduleBase + (int)nt.OptionalHeader.AddressOfEntryPoint);
+        var callbacks = CollectTlsCallbacks(hProcess, moduleBase, nt);
 
-        // Call LdrpHandleTlsData first
-        if (ldrpHandleTlsData != 0 && ldrEntry != 0)
+        nint callbacksRemote = nint.Zero;
+        int callbacksLen = 0;
+        if (callbacks.Count > 0)
+        {
+            var cbBytes = callbacks.SelectMany(BitConverter.GetBytes).Concat(new byte[8]).ToArray();
+            callbacksLen = cbBytes.Length;
+            callbacksRemote = AllocateMemory(hProcess, (uint)callbacksLen, PAGE_READWRITE);
+            WriteMemory(hProcess, callbacksRemote, cbBytes);
+        }
+
+        var b = new StubBuilder().Sub_Rsp(0x48);
+
+        // Acquire loader lock (so PEB inserts + LdrpHandleTlsData + DllMain run as the loader expects)
+        EmitLoaderLockAcquire(b, loaderFns.Lock);
+        EmitInsertIntoPebLists(b, ldrStructures);
+
+        // LdrpHandleTlsData initializes TLS for this thread
+        var ldrEntry = (ulong)ldrStructures.Allocations.LdrEntry;
+        if (ldrpHandleTlsDataAddr != nint.Zero && ldrEntry != 0)
         {
             b.Mov_Reg_Imm64(1, ldrEntry)
              .Mov_Dl(1)
-             .Mov_Reg_Imm64(0, ldrpHandleTlsData)
+             .Mov_Reg_Imm64(0, (ulong)ldrpHandleTlsDataAddr)
              .Call_Rax();
         }
 
-        // Call TLS callbacks before DllMain (mirrors what the loader does)
-        if (callbacksAddr != 0)
-            b.CallTlsCallbacks(callbacksAddr, moduleBase, debugMarker: 0);
+        if (callbacksRemote != nint.Zero)
+            b.CallTlsCallbacks((ulong)callbacksRemote, (ulong)moduleBase, debugMarker: 0);
 
-        // Call DllMain
-        b.Mov_Reg_Imm64(1, moduleBase)
+        // DllMain(moduleBase, DLL_PROCESS_ATTACH, NULL)
+        b.Mov_Reg_Imm64(1, (ulong)moduleBase)
          .Mov_Edx_Imm32(1)
          .Xor_R8_R8()
          .Mov_Reg_Imm64(0, dllMain)
          .Call_Rax();
 
-        // Call DotnetMain if provided
-        if (dotnetMain != 0)
-            b.Mov_Reg_Imm64(0, dotnetMain).Call_Rax();
+        if (dotnetMainAddr != nint.Zero)
+            b.Mov_Reg_Imm64(0, (ulong)dotnetMainAddr).Call_Rax();
 
-        // Erase headers
-        if (headerSize > 0)
-            b.EraseMemory(moduleBase, headerSize);
+        EmitRemoveFromPebLists(b, ldrStructures);
+        EmitLoaderLockRelease(b, loaderFns.Unlock);
 
-        b.Add_Rsp(0x28).Ret();
+        if (nt.OptionalHeader.SizeOfHeaders > 0)
+            b.EraseMemory((ulong)moduleBase, nt.OptionalHeader.SizeOfHeaders);
+
+        b.Add_Rsp(0x48).Ret();
 
         var stub = b.Build();
         var remote = AllocateMemory(hProcess, (uint)stub.Length, PAGE_READWRITE);
         WriteMemory(hProcess, remote, stub);
         ProtectMemory(hProcess, remote, (uint)stub.Length, PAGE_EXECUTE_READ);
         FlushInstructionCache(hProcess, remote, (uint)stub.Length);
-        return remote;
+        return (remote, stub.Length, callbacksRemote, callbacksLen);
     }
 
     #endregion
@@ -1149,8 +1319,59 @@ public static partial class ManualMapper
         public StubBuilder Mov_Edx_Imm32(uint imm) => Emit(0xBA).Emit(BitConverter.GetBytes(imm));
         public StubBuilder Mov_Dl(byte imm) => Emit(0xB2, imm);
         public StubBuilder Xor_R8_R8() => Emit(0x41, 0x31, 0xC0);
+        public StubBuilder Xor_Ecx_Ecx() => Emit(0x31, 0xC9);
         public StubBuilder Cmp_Rcx_Rax() => Emit(0x48, 0x39, 0xC1);
         public StubBuilder Mov_Ptr_Rcx_Rdx() => Emit(0x48, 0x89, 0x11);
+
+        /// <summary>lea rdx, [rsp + disp8] - load effective address of stack local into rdx.</summary>
+        public StubBuilder Lea_Rdx_RspDisp8(byte disp) => Emit(0x48, 0x8D, 0x54, 0x24, disp);
+
+        /// <summary>lea r8, [rsp + disp8] - load effective address of stack local into r8.</summary>
+        public StubBuilder Lea_R8_RspDisp8(byte disp) => Emit(0x4C, 0x8D, 0x44, 0x24, disp);
+
+        /// <summary>mov rdx, [rsp + disp8] - load qword from stack local into rdx.</summary>
+        public StubBuilder Mov_Rdx_QwordPtr_RspDisp8(byte disp) => Emit(0x48, 0x8B, 0x54, 0x24, disp);
+
+        #endregion
+
+        #region Doubly-Linked List Operations
+
+        /// <summary>
+        /// Emits the equivalent of InsertTailList(listHead, entry):
+        /// <code>
+        ///   prevTail        = listHead.Blink
+        ///   entry.Flink     = listHead
+        ///   entry.Blink     = prevTail
+        ///   prevTail.Flink  = entry
+        ///   listHead.Blink  = entry
+        /// </code>
+        /// Clobbers RAX, RCX, RDX. Caller must hold the appropriate lock (loader lock for PEB lists).
+        /// </summary>
+        public StubBuilder InsertTailList(ulong listHead, ulong entry) =>
+            Mov_Reg_Imm64(2, listHead)              // mov rdx, listHead
+            .Mov_Reg_Imm64(1, entry)                // mov rcx, entry
+            .Emit(0x48, 0x8B, 0x42, 0x08)           // mov rax, [rdx+8]   - prevTail = listHead.Blink
+            .Emit(0x48, 0x89, 0x11)                 // mov [rcx], rdx     - entry.Flink = listHead
+            .Emit(0x48, 0x89, 0x41, 0x08)           // mov [rcx+8], rax   - entry.Blink = prevTail
+            .Emit(0x48, 0x89, 0x08)                 // mov [rax], rcx     - prevTail.Flink = entry
+            .Emit(0x48, 0x89, 0x4A, 0x08);          // mov [rdx+8], rcx   - listHead.Blink = entry
+
+        /// <summary>
+        /// Emits the equivalent of RemoveEntryList(entry):
+        /// <code>
+        ///   flink = entry.Flink
+        ///   blink = entry.Blink
+        ///   blink.Flink = flink
+        ///   flink.Blink = blink
+        /// </code>
+        /// Clobbers RAX, RCX, RDX. Caller must hold the appropriate lock.
+        /// </summary>
+        public StubBuilder RemoveEntryList(ulong entry) =>
+            Mov_Reg_Imm64(1, entry)                 // mov rcx, entry
+            .Emit(0x48, 0x8B, 0x01)                 // mov rax, [rcx]     - flink
+            .Emit(0x48, 0x8B, 0x51, 0x08)           // mov rdx, [rcx+8]   - blink
+            .Emit(0x48, 0x89, 0x02)                 // mov [rdx], rax     - blink.Flink = flink
+            .Emit(0x48, 0x89, 0x50, 0x08);          // mov [rax+8], rdx   - flink.Blink = blink
 
         #endregion
 

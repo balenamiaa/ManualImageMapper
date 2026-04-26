@@ -25,6 +25,7 @@ public static partial class Win32
         public const ulong DEBUG_MARKER_PRE_DLLMAIN = Constants.DEBUG_MARKER_PRE_DLLMAIN;
         public const ulong DEBUG_MARKER_POST_DLLMAIN = Constants.DEBUG_MARKER_POST_DLLMAIN;
         public const ulong DEBUG_MARKER_POST_DOTNETMAIN = Constants.DEBUG_MARKER_POST_DOTNETMAIN;
+        public const ulong SYNC_MARKER_DONE = Constants.SYNC_MARKER_DONE;
 
         // PE Format
         public const ulong IMAGE_ORDINAL_FLAG64 = Constants.IMAGE_ORDINAL_FLAG64;
@@ -205,17 +206,17 @@ public static partial class Win32
 
     public static int FindLdrpHandleTlsDataOffset() => PatternScanner.FindLdrpHandleTlsDataOffset();
 
-    public static nint LinkModuleToPEB(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName, string fullDllPath) =>
-        PebLinker.LinkModuleToPEB(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName, fullDllPath);
+    public static LdrStructures BuildLdrEntry(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName, string fullDllPath) =>
+        PebLinker.BuildLdrEntry(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName, fullDllPath);
 
-    public static nint InitializeCrtModule(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName) =>
-        PebLinker.InitializeCrtModule(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName);
-
-    public static (nint remoteLdrEntry, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName) =>
+    public static (LdrStructures structures, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(nint hProcess, int pid, nint moduleBase, uint sizeOfImage, nint entryPoint, ulong originalImageBase, string dllName) =>
         PebLinker.InitializeCrtModulePebOnly(hProcess, pid, moduleBase, sizeOfImage, entryPoint, originalImageBase, dllName);
 
     public static void UnlinkFromPEB(nint hProcess, nint moduleBase) =>
         PebLinker.UnlinkFromPEB(hProcess, moduleBase);
+
+    public static void FreePebLinkAllocations(nint hProcess, in PebLinkResult result) =>
+        PebLinker.FreePebLinkAllocations(hProcess, result);
 
     public static uint ComputeModuleNameHash(string dllName) => PebLinker.ComputeModuleNameHash(dllName);
 

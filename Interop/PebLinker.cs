@@ -5,6 +5,43 @@ using static ManualImageMapper.Interop.Structures;
 namespace ManualImageMapper.Interop;
 
 /// <summary>
+/// Tracks every remote allocation made by <see cref="PebLinker.BuildLdrEntry"/> so the host
+/// can erase + free them after unlinking — leaves no LDR-shaped artifact in the target.
+/// </summary>
+public readonly record struct PebLinkResult(
+    nint LdrEntry,
+    nint DdagNode,
+    nint BaseDllName,
+    nint FullDllName,
+    int LdrEntrySize,
+    int DdagNodeSize,
+    int BaseDllNameSize,
+    int FullDllNameSize)
+{
+    public static PebLinkResult Empty => default;
+    public bool IsEmpty => LdrEntry == nint.Zero;
+}
+
+/// <summary>
+/// Bundle of PEB-side addresses that a hijack/CRT stub needs to splice the new module into the
+/// loader's three doubly-linked module lists. The stub does the inserts under loader lock;
+/// nothing here mutates the target — this is just metadata produced by <see cref="PebLinker.BuildLdrEntry"/>.
+/// </summary>
+public readonly record struct LdrStructures(
+    PebLinkResult Allocations,
+    nint Ldr,
+    nint InLoadOrderHead,
+    nint InMemoryOrderHead,
+    nint InInitializationOrderHead,
+    nint InLoadOrderEntryAddr,
+    nint InMemoryOrderEntryAddr,
+    nint InInitializationOrderEntryAddr)
+{
+    public static LdrStructures Empty => default;
+    public bool IsEmpty => Allocations.IsEmpty;
+}
+
+/// <summary>
 /// Handles linking manually mapped modules into the Windows loader's
 /// PEB data structures. Required for CRT/TLS support.
 /// </summary>
@@ -21,11 +58,17 @@ public static class PebLinker
     /// - TLS support (LdrpHandleTlsData needs the entry)
     /// - Various APIs that query module lists
     ///
-    /// The entry is NOT freed after use - it must stay linked for the module
-    /// to function correctly. It will be unlinked later by UnlinkFromPEB.
+    /// The entry is NOT freed after use - it must stay linked for the module to function correctly.
+    /// In the stub-based flow it's unlinked in-target under loader lock; <see cref="UnlinkFromPEB"/>
+    /// remains as a host-side fallback (e.g. when the stub fails before unlinking itself).
     /// </summary>
-    /// <returns>Address of the LDR_DATA_TABLE_ENTRY in remote process, or Zero on failure.</returns>
-    public static nint LinkModuleToPEB(
+    /// <summary>
+    /// Allocates and initializes the LDR_DATA_TABLE_ENTRY (and friends) inside the target process,
+    /// but does <strong>not</strong> insert it into the PEB's three module lists. The caller's stub
+    /// performs the inserts under loader lock to avoid racing with the target's own loader.
+    /// </summary>
+    /// <returns>Allocation tracker + listHead/entry addresses for stub-side linking, or <see cref="LdrStructures.Empty"/> on failure.</returns>
+    public static LdrStructures BuildLdrEntry(
         nint hProcess,
         int pid,
         nint moduleBase,
@@ -35,7 +78,7 @@ public static class PebLinker
         string dllName,
         string fullDllPath)
     {
-        Log.Debug("Linking module to PEB: {DllName} at 0x{Base:X}", dllName, (ulong)moduleBase);
+        Log.Debug("Building LDR entry for: {DllName} at 0x{Base:X}", dllName, (ulong)moduleBase);
 
         // Get PEB address via NtQueryInformationProcess
         var status = NativeMethods.NtQueryInformationProcess(
@@ -48,7 +91,7 @@ public static class PebLinker
         if (status != 0 || pbi.PebBaseAddress == nint.Zero)
         {
             Log.Warning("Failed to get PEB address, status=0x{Status:X}", status);
-            return nint.Zero;
+            return LdrStructures.Empty;
         }
 
         // Read PEB.Ldr pointer
@@ -57,7 +100,7 @@ public static class PebLinker
         if (ldr == nint.Zero)
         {
             Log.Warning("PEB.Ldr is null");
-            return nint.Zero;
+            return LdrStructures.Empty;
         }
 
         Log.Debug("PEB=0x{Peb:X}, Ldr=0x{Ldr:X}", (ulong)pbi.PebBaseAddress, (ulong)ldr);
@@ -65,9 +108,11 @@ public static class PebLinker
         // Allocate strings in remote process
         var dllNameWide = System.Text.Encoding.Unicode.GetBytes(dllName + "\0");
         var fullPathWide = System.Text.Encoding.Unicode.GetBytes(fullDllPath + "\0");
+        int dllNameSize = dllNameWide.Length;
+        int fullPathSize = fullPathWide.Length;
 
-        var remoteDllName = MemoryHelpers.AllocateMemory(hProcess, (uint)dllNameWide.Length);
-        var remoteFullPath = MemoryHelpers.AllocateMemory(hProcess, (uint)fullPathWide.Length);
+        var remoteDllName = MemoryHelpers.AllocateMemory(hProcess, (uint)dllNameSize);
+        var remoteFullPath = MemoryHelpers.AllocateMemory(hProcess, (uint)fullPathSize);
         MemoryHelpers.WriteMemory(hProcess, remoteDllName, dllNameWide);
         MemoryHelpers.WriteMemory(hProcess, remoteFullPath, fullPathWide);
 
@@ -137,153 +182,55 @@ public static class PebLinker
 
         MemoryHelpers.WriteMemory(hProcess, remoteLdrEntry, MemoryHelpers.StructureToBytes(ldrEntry));
 
-        // Link into the three PEB module lists
-        nint inLoadOrderListHead = ldr + 0x10;
-        nint inMemoryOrderListHead = ldr + 0x20;
-        nint inInitOrderListHead = ldr + 0x30;
-
+        // Compute addresses the stub needs to link the entry into PEB's three lists.
+        // The stub does the InsertTailList sequence under loader lock; the host only allocates.
         int inLoadOrderOffset = (int)Marshal.OffsetOf<LDR_DATA_TABLE_ENTRY>("InLoadOrderLinks");
         int inMemoryOrderOffset = (int)Marshal.OffsetOf<LDR_DATA_TABLE_ENTRY>("InMemoryOrderLinks");
         int inInitOrderOffset = (int)Marshal.OffsetOf<LDR_DATA_TABLE_ENTRY>("InInitializationOrderLinks");
 
-        InsertTailList(hProcess, inLoadOrderListHead, remoteLdrEntry + inLoadOrderOffset);
-        InsertTailList(hProcess, inMemoryOrderListHead, remoteLdrEntry + inMemoryOrderOffset);
-        InsertTailList(hProcess, inInitOrderListHead, remoteLdrEntry + inInitOrderOffset);
+        var allocations = new PebLinkResult(
+            remoteLdrEntry, remoteDdagNode, remoteDllName, remoteFullPath,
+            entrySize, ddagSize, dllNameSize, fullPathSize);
 
-        Log.Information("Module linked to PEB loader lists: {DllName}", dllName);
-        return remoteLdrEntry;
+        Log.Debug("LDR entry built: {DllName} - stub will link to PEB under loader lock", dllName);
+        return new LdrStructures(
+            allocations,
+            ldr,
+            ldr + 0x10,
+            ldr + 0x20,
+            ldr + 0x30,
+            remoteLdrEntry + inLoadOrderOffset,
+            remoteLdrEntry + inMemoryOrderOffset,
+            remoteLdrEntry + inInitOrderOffset);
     }
 
     /// <summary>
-    /// Initializes CRT support for a manually mapped module.
-    ///
-    /// This performs two critical steps:
-    /// 1. Links the module into PEB (so CRT can find it)
-    /// 2. Calls LdrpHandleTlsData (to initialize Thread Local Storage)
-    ///
-    /// Without this, CRT DLLs will crash during initialization because:
-    /// - CRT checks if the module is registered with the loader
-    /// - CRT uses TLS for errno, thread state, etc.
-    ///
-    /// IMPORTANT: This variant calls LdrpHandleTlsData via CreateRemoteThread,
-    /// which only initializes TLS for THAT thread. For thread hijacking or
-    /// when TLS must work on a specific thread, use InitializeCrtModulePebOnly
-    /// and call LdrpHandleTlsData from within that thread's context.
+    /// Zeroes and frees every allocation produced by <see cref="BuildLdrEntry"/>.
+    /// Call this only after the entry has been unlinked from the PEB lists (typically by the
+    /// hijack/CRT stub under loader lock) so no thread can still reach it.
     /// </summary>
-    /// <returns>Address of LDR_DATA_TABLE_ENTRY, or Zero on failure.</returns>
-    public static nint InitializeCrtModule(
-        nint hProcess,
-        int pid,
-        nint moduleBase,
-        uint sizeOfImage,
-        nint entryPoint,
-        ulong originalImageBase,
-        string dllName)
+    public static void FreePebLinkAllocations(nint hProcess, in PebLinkResult result)
     {
-        // Generate a fake full path (looks legitimate)
-        string fullPath = $"C:\\Windows\\System32\\{dllName}";
+        if (result.IsEmpty) return;
 
-        // Step 1: Link module into PEB
-        var remoteLdrEntry = LinkModuleToPEB(hProcess, pid, moduleBase, sizeOfImage,
-            entryPoint, originalImageBase, dllName, fullPath);
+        TryEraseAndFree(hProcess, result.LdrEntry, result.LdrEntrySize);
+        TryEraseAndFree(hProcess, result.DdagNode, result.DdagNodeSize);
+        TryEraseAndFree(hProcess, result.BaseDllName, result.BaseDllNameSize);
+        TryEraseAndFree(hProcess, result.FullDllName, result.FullDllNameSize);
+    }
 
-        if (remoteLdrEntry == nint.Zero)
-        {
-            Log.Warning("Failed to link module to PEB");
-            return nint.Zero;
-        }
-
-        // Step 2: Call LdrpHandleTlsData to initialize TLS
-        var funcOffset = PatternScanner.FindLdrpHandleTlsDataOffset();
-        if (funcOffset < 0)
-        {
-            Log.Warning("LdrpHandleTlsData not found - TLS may not work correctly");
-            return remoteLdrEntry;
-        }
-
-        var remoteNtdll = ModuleHelpers.GetRemoteModuleHandle(hProcess, pid, "ntdll.dll");
-        if (remoteNtdll == nint.Zero)
-        {
-            Log.Warning("Could not find ntdll.dll in remote process");
-            return remoteLdrEntry;
-        }
-
-        var ldrpHandleTlsData = remoteNtdll + funcOffset;
-        Log.Debug("Calling LdrpHandleTlsData at 0x{Addr:X} with entry at 0x{Entry:X}",
-            (ulong)ldrpHandleTlsData, (ulong)remoteLdrEntry);
-
-        // Allocate space for NTSTATUS result
-        var remoteResult = MemoryHelpers.AllocateMemory(hProcess, 8);
-        MemoryHelpers.WriteMemory(hProcess, remoteResult, BitConverter.GetBytes(0xDEADBEEFu));
-
-        var stub = PatternScanner.BuildLdrpHandleTlsDataStub(
-            (ulong)ldrpHandleTlsData, (ulong)remoteLdrEntry, (ulong)remoteResult);
-        var remoteStub = MemoryHelpers.AllocateMemory(hProcess, (uint)stub.Length);
-
+    private static void TryEraseAndFree(nint hProcess, nint addr, int size)
+    {
+        if (addr == nint.Zero || size <= 0) return;
         try
         {
-            MemoryHelpers.WriteMemory(hProcess, remoteStub, stub);
-            MemoryHelpers.ProtectMemory(hProcess, remoteStub, (uint)stub.Length, Constants.PAGE_EXECUTE_READ);
-            NativeMethods.FlushInstructionCache(hProcess, remoteStub, (uint)stub.Length);
-
-            try
-            {
-                MemoryHelpers.CreateRemoteThreadAndWait(hProcess, remoteStub, nint.Zero, wait: true);
-
-                // Read and log the result
-                var resultBytes = MemoryHelpers.ReadMemory(hProcess, remoteResult, 4);
-                uint ntstatus = BitConverter.ToUInt32(resultBytes);
-                Log.Debug("LdrpHandleTlsData returned NTSTATUS: 0x{Status:X8}", ntstatus);
-
-                if (ntstatus == 0)
-                    Log.Debug("LdrpHandleTlsData executed successfully (STATUS_SUCCESS)");
-                else
-                    Log.Warning("LdrpHandleTlsData failed with NTSTATUS: 0x{Status:X8}", ntstatus);
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Failed to execute LdrpHandleTlsData stub");
-            }
-
-            // Verify TlsIndex was set - check both LDR entry and actual _tls_index in DLL
-            int tlsIndexOffset = (int)Marshal.OffsetOf<LDR_DATA_TABLE_ENTRY>("TlsIndex");
-            var tlsIndexBytes = MemoryHelpers.ReadMemory(hProcess, remoteLdrEntry + tlsIndexOffset, 2);
-            ushort ldrTlsIndex = BitConverter.ToUInt16(tlsIndexBytes);
-            Log.Debug("LDR_DATA_TABLE_ENTRY.TlsIndex = 0x{TlsIndex:X}", ldrTlsIndex);
-
-            // Also read the actual _tls_index from the DLL's TLS directory
-            // This is what the DLL code actually uses
-            try
-            {
-                // Read PE headers to find TLS directory
-                var dosHeader = PeHelpers.GetDosHeader(MemoryHelpers.ReadMemory(hProcess, moduleBase, 64));
-                var ntHeadersBytes = MemoryHelpers.ReadMemory(hProcess, moduleBase + dosHeader.e_lfanew, Marshal.SizeOf<IMAGE_NT_HEADERS64>());
-                var nt = MemoryHelpers.BytesToStructure<IMAGE_NT_HEADERS64>(ntHeadersBytes);
-                var tlsDir = nt.OptionalHeader.DataDirectory[(int)ImageDirectoryEntry.TLS];
-
-                if (tlsDir.Size > 0)
-                {
-                    var tlsBytes = MemoryHelpers.ReadMemory(hProcess, moduleBase + (int)tlsDir.VirtualAddress, Marshal.SizeOf<IMAGE_TLS_DIRECTORY64>());
-                    var tls = MemoryHelpers.BytesToStructure<IMAGE_TLS_DIRECTORY64>(tlsBytes);
-
-                    // Read the actual _tls_index value from AddressOfIndex
-                    var actualIndexBytes = MemoryHelpers.ReadMemory(hProcess, (nint)tls.AddressOfIndex, 4);
-                    uint actualTlsIndex = BitConverter.ToUInt32(actualIndexBytes);
-                    Log.Debug("Actual _tls_index at 0x{Addr:X} = 0x{Value:X}", tls.AddressOfIndex, actualTlsIndex);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Failed to read actual _tls_index");
-            }
+            MemoryHelpers.WriteMemory(hProcess, addr, new byte[size]);
+            MemoryHelpers.FreeMemory(hProcess, addr);
         }
-        finally
+        catch (Exception ex)
         {
-            MemoryHelpers.FreeMemory(hProcess, remoteStub);
-            MemoryHelpers.FreeMemory(hProcess, remoteResult);
+            Log.Verbose(ex, "Failed to erase/free 0x{Addr:X} ({Size} bytes)", (ulong)addr, size);
         }
-
-        return remoteLdrEntry;
     }
 
     /// <summary>
@@ -294,8 +241,8 @@ public static class PebLinker
     /// Also returns the LdrpHandleTlsData address so the caller can call it
     /// from the correct thread context.
     /// </summary>
-    /// <returns>Tuple of (LDR entry address, LdrpHandleTlsData address) or (Zero, Zero) on failure.</returns>
-    public static (nint remoteLdrEntry, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(
+    /// <returns>Tuple of (LDR structure metadata, LdrpHandleTlsData address) - either may be empty/zero on partial failure.</returns>
+    public static (LdrStructures structures, nint ldrpHandleTlsDataAddr) InitializeCrtModulePebOnly(
         nint hProcess,
         int pid,
         nint moduleBase,
@@ -306,13 +253,13 @@ public static class PebLinker
     {
         string fullPath = $"C:\\Windows\\System32\\{dllName}";
 
-        var remoteLdrEntry = LinkModuleToPEB(hProcess, pid, moduleBase, sizeOfImage,
+        var structures = BuildLdrEntry(hProcess, pid, moduleBase, sizeOfImage,
             entryPoint, originalImageBase, dllName, fullPath);
 
-        if (remoteLdrEntry == nint.Zero)
+        if (structures.IsEmpty)
         {
-            Log.Warning("Failed to link module to PEB");
-            return (nint.Zero, nint.Zero);
+            Log.Warning("Failed to build LDR entry");
+            return (LdrStructures.Empty, nint.Zero);
         }
 
         // Find LdrpHandleTlsData address but don't call it yet
@@ -320,21 +267,21 @@ public static class PebLinker
         if (funcOffset < 0)
         {
             Log.Warning("LdrpHandleTlsData not found - TLS may not work correctly");
-            return (remoteLdrEntry, nint.Zero);
+            return (structures, nint.Zero);
         }
 
         var remoteNtdll = ModuleHelpers.GetRemoteModuleHandle(hProcess, pid, "ntdll.dll");
         if (remoteNtdll == nint.Zero)
         {
             Log.Warning("Could not find ntdll.dll in remote process");
-            return (remoteLdrEntry, nint.Zero);
+            return (structures, nint.Zero);
         }
 
         var ldrpHandleTlsData = remoteNtdll + funcOffset;
         Log.Debug("LdrpHandleTlsData at 0x{Addr:X}, LDR entry at 0x{Entry:X} - will be called from stub",
-            (ulong)ldrpHandleTlsData, (ulong)remoteLdrEntry);
+            (ulong)ldrpHandleTlsData, (ulong)structures.Allocations.LdrEntry);
 
-        return (remoteLdrEntry, ldrpHandleTlsData);
+        return (structures, ldrpHandleTlsData);
     }
 
     /// <summary>
@@ -408,20 +355,6 @@ public static class PebLinker
     }
 
     #region Private Helpers
-
-    /// <summary>
-    /// Inserts an entry at the tail of a doubly-linked list.
-    /// </summary>
-    private static void InsertTailList(nint hProcess, nint listHead, nint entry)
-    {
-        var blinkBytes = MemoryHelpers.ReadMemory(hProcess, listHead + 8, 8);
-        var prevEntry = (nint)BitConverter.ToInt64(blinkBytes);
-
-        MemoryHelpers.WriteMemory(hProcess, entry, BitConverter.GetBytes((long)listHead));
-        MemoryHelpers.WriteMemory(hProcess, entry + 8, BitConverter.GetBytes((long)prevEntry));
-        MemoryHelpers.WriteMemory(hProcess, prevEntry, BitConverter.GetBytes((long)entry));
-        MemoryHelpers.WriteMemory(hProcess, listHead + 8, BitConverter.GetBytes((long)entry));
-    }
 
     private static bool TryReadPointer(nint hProcess, nint address, out nint value)
     {
