@@ -24,6 +24,8 @@ public static partial class Win32
         public const ulong DEBUG_MARKER_POST_TLS = Constants.DEBUG_MARKER_POST_TLS;
         public const ulong DEBUG_MARKER_PRE_DLLMAIN = Constants.DEBUG_MARKER_PRE_DLLMAIN;
         public const ulong DEBUG_MARKER_POST_DLLMAIN = Constants.DEBUG_MARKER_POST_DLLMAIN;
+        public const ulong DEBUG_MARKER_POST_PEB_UNLINK = Constants.DEBUG_MARKER_POST_PEB_UNLINK;
+        public const ulong DEBUG_MARKER_POST_LOCK_RELEASE = Constants.DEBUG_MARKER_POST_LOCK_RELEASE;
         public const ulong DEBUG_MARKER_POST_DOTNETMAIN = Constants.DEBUG_MARKER_POST_DOTNETMAIN;
         public const ulong SYNC_MARKER_DONE = Constants.SYNC_MARKER_DONE;
 

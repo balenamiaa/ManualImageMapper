@@ -27,6 +27,12 @@ public static class Constants
     /// <summary>Written after DllMain returns successfully.</summary>
     public const ulong DEBUG_MARKER_POST_DLLMAIN = 0x1337DEADBEEFCAFE;
 
+    /// <summary>Written after PEB list unlink completes.</summary>
+    public const ulong DEBUG_MARKER_POST_PEB_UNLINK = 0xA1A1A1A1A1A1A1A1;
+
+    /// <summary>Written after the loader-lock release returns.</summary>
+    public const ulong DEBUG_MARKER_POST_LOCK_RELEASE = 0xA2A2A2A2A2A2A2A2;
+
     /// <summary>Written after DotnetMain returns successfully.</summary>
     public const ulong DEBUG_MARKER_POST_DOTNETMAIN = 0x4444444444444444;
 

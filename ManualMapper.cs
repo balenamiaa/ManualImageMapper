@@ -267,6 +267,8 @@ public static partial class ManualMapper
                 DEBUG_MARKER_POST_TLS => "POST_TLS",
                 DEBUG_MARKER_PRE_DLLMAIN => "PRE_DLLMAIN",
                 DEBUG_MARKER_POST_DLLMAIN => "POST_DLLMAIN",
+                DEBUG_MARKER_POST_PEB_UNLINK => "POST_PEB_UNLINK",
+                DEBUG_MARKER_POST_LOCK_RELEASE => "POST_LOCK_RELEASE",
                 DEBUG_MARKER_POST_DOTNETMAIN => "POST_DOTNETMAIN",
                 SYNC_MARKER_DONE => "DONE",
                 _ => $"UNKNOWN (0x{value:X})"
@@ -567,70 +569,150 @@ public static partial class ManualMapper
     #region NativeAOT Support
 
     /// <summary>
-    /// Hooks PalGetModuleHandleFromPointer to return our module base for pointers within our module.
-    /// NativeAOT calls GetModuleHandleExW which fails for manually mapped modules.
+    /// Replaces NativeAOT's <c>PalGetModuleHandleFromPointer</c> with a stub that returns our
+    /// module base when called with a pointer in our DLL's range, and NULL otherwise.
     ///
-    /// Layout of the hook (offsets from start of trampoline):
+    /// <para>Why this is needed: <c>PalGetModuleHandleFromPointer</c> is a thin wrapper around
+    /// <c>GetModuleHandleExW(FROM_ADDRESS|PIN, p, &amp;hMod)</c>. The kernel's lookup uses
+    /// <c>LdrpModuleBaseAddressIndex</c> (an RB tree the manual mapper does not update), so for
+    /// a manually-mapped DLL the call returns NULL. The runtime then hangs in lazy init because
+    /// it has no module handle.</para>
+    ///
+    /// <para>Detection signature: <c>B9 05 00 00 00 FF 15 ?? ?? ?? ??</c>
+    /// (<c>mov ecx, 5</c> = FROM_ADDRESS|PIN flag combo, then <c>call qword ptr [rip+disp32]</c>
+    /// = the IAT call to <c>GetModuleHandleExW</c>). This signature is highly distinctive — only
+    /// one match exists in a typical NativeAOT shared library — and survives codegen changes
+    /// (security cookies, frame size adjustments) since it keys on the call site, not the
+    /// prologue.</para>
+    ///
+    /// <para>Hook layout (overwrites the original function in place — no prologue stealing,
+    /// no relocation of RIP-relative instructions, no trampoline back to original):</para>
     /// <code>
-    ///   0:  mov rax, moduleBase            ; 10 bytes
-    ///   10: cmp rcx, rax                   ;  3 bytes
-    ///   13: jb +26 -> original (offset 41) ;  2 bytes
-    ///   15: mov rax, moduleEnd             ; 10 bytes
-    ///   25: cmp rcx, rax                   ;  3 bytes
-    ///   28: jae +11 -> original            ;  2 bytes
-    ///   30: mov rax, moduleBase            ; 10 bytes (in-range: return moduleBase)
-    ///   40: ret                            ;  1 byte
-    ///   41: &lt;stolen prologue, 17 bytes&gt;  ; copied from original function
-    ///   58: jmp [rip+0]; funcAddr+17       ; 14 bytes (resume after stolen)
+    ///   mov rax, moduleBase
+    ///   cmp rcx, rax
+    ///   jb  null
+    ///   mov rax, moduleEnd
+    ///   cmp rcx, rax
+    ///   jae null
+    ///   mov rax, moduleBase     ; in-range: return our module base
+    ///   ret
+    ///  null:
+    ///   xor eax, eax            ; out-of-range: return NULL (matches what the kernel would
+    ///   ret                       ; return for a non-loaded address)
     /// </code>
-    /// The original function's first 14 bytes are overwritten with an absolute jmp to the
-    /// trampoline. Because the stolen prologue is 17 bytes (3 instruction boundary past 14),
-    /// the trampoline copies all 17 bytes and resumes at funcAddr+17.
+    /// <para>NativeAOT only ever calls this with pointers inside its own runtime, so the
+    /// out-of-range branch is defensive — it doesn't lose functionality for the runtime's needs.</para>
     /// </summary>
     private static void PatchNativeAotModuleLookup(nint hProcess, nint remoteBase, byte[] dll, uint sizeOfImage)
     {
-        const int stolenSize = 17;
-        byte[] pattern = [0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xD1, 0x4C, 0x8D, 0x44, 0x24, 0x38, 0xB9, 0x05, 0x00, 0x00, 0x00];
+        // Find the unique `mov ecx, 5; call qword ptr [rip+disp]` site, then walk back to the
+        // function prologue (`sub rsp, imm8`). We work in FILE offsets while reading dll[] then
+        // convert to RVA once for the runtime patch.
+        var (callFileOff, sectionRvaDelta) = FindPalGetModuleHandleCallSite(dll);
+        if (callFileOff < 0)
+        {
+            Log.Warning("PalGetModuleHandleFromPointer signature not found — NativeAOT runtime init will likely hang. Check codegen.");
+            return;
+        }
 
-        int rva = FindPattern(dll, pattern);
-        if (rva < 0) return;
+        int funcFileOff = -1;
+        // Walk backwards looking for `sub rsp, imm8` (48 83 EC ??) preceded by CC/90 padding.
+        for (int i = callFileOff - 1; i >= callFileOff - 256 && i >= 0; i--)
+        {
+            if (dll[i] == 0x48 && dll[i + 1] == 0x83 && dll[i + 2] == 0xEC)
+            {
+                if (i == 0 || dll[i - 1] == 0xCC || dll[i - 1] == 0x90)
+                {
+                    funcFileOff = i;
+                    break;
+                }
+            }
+        }
+        if (funcFileOff < 0)
+        {
+            Log.Warning("PalGetModuleHandleFromPointer call site found at file offset 0x{Site:X} but couldn't locate function prologue.", callFileOff);
+            return;
+        }
 
-        var funcAddr = remoteBase + rva;
+        // Convert file offset → RVA (delta is the same for both since they're in the same section)
+        int funcRva = funcFileOff + sectionRvaDelta;
+        int callSiteRva = callFileOff + sectionRvaDelta;
+        ulong funcAddr = (ulong)remoteBase + (uint)funcRva;
         ulong moduleEnd = (ulong)remoteBase + sizeOfImage;
 
-        // Stolen prologue is position-independent (sub/mov-reg-reg/lea sib/mov-imm32) - safe to relocate.
-        byte[] stolenPrologue = dll.AsSpan(rva, stolenSize).ToArray();
-
-        var hook = new StubBuilder()
-            .Mov_Reg_Imm64(0, (ulong)remoteBase)        // 0:  rax = moduleBase
-            .Cmp_Rcx_Rax()                               // 10: cmp rcx, rax
-            .Jb(26)                                      // 13: ptr < base -> original at 41
-            .Mov_Reg_Imm64(0, moduleEnd)                // 15: rax = moduleEnd
-            .Cmp_Rcx_Rax()                               // 25: cmp rcx, rax
-            .Jae(11)                                     // 28: ptr >= end -> original at 41
-            .Mov_Reg_Imm64(0, (ulong)remoteBase)        // 30: rax = moduleBase (in-range)
-            .Ret()                                       // 40: return moduleBase
-            .Raw(stolenPrologue)                         // 41: original branch - stolen bytes
-            .Jmp_Indirect((ulong)funcAddr + stolenSize) // 58: resume after prologue
+        // Build the in-place replacement. 44 bytes total. Layout (offsets):
+        //   0:  mov rax, moduleBase    (10)
+        //   10: cmp rcx, rax           (3)
+        //   13: jb 26 → null at 41     (2)
+        //   15: mov rax, moduleEnd     (10)
+        //   25: cmp rcx, rax           (3)
+        //   28: jae 11 → null at 41    (2)
+        //   30: mov rax, moduleBase    (10) — in-range, return base
+        //   40: ret                    (1)
+        //   41: xor eax, eax           (2) — null label
+        //   43: ret                    (1)
+        var stub = new StubBuilder()
+            .Mov_Reg_Imm64(0, (ulong)remoteBase)
+            .Cmp_Rcx_Rax()
+            .Jb(26)
+            .Mov_Reg_Imm64(0, moduleEnd)
+            .Cmp_Rcx_Rax()
+            .Jae(11)
+            .Mov_Reg_Imm64(0, (ulong)remoteBase)
+            .Ret()
+            .Raw([0x33, 0xC0])
+            .Ret()
             .Build();
 
-        var hookAddr = AllocateMemory(hProcess, (uint)hook.Length, PAGE_EXECUTE_READWRITE);
-        WriteMemory(hProcess, hookAddr, hook);
-        ProtectMemory(hProcess, hookAddr, (uint)hook.Length, PAGE_EXECUTE_READ);
+        // Overwrite function entry. We need to ensure we don't write past the function (corrupting
+        // the next function). The shortest path: the call site is 27 bytes from prologue start; we
+        // need at most ~44 bytes for the hook. If hook fits within (callSiteRva - funcRva) + 7
+        // (call instruction length) bytes, we're safe. If not, log a warning and refuse.
+        int functionMinLen = (callSiteRva + 7) - funcRva; // includes the call instruction itself
+        if (stub.Length > functionMinLen + 32) // generous slack — most functions tail-call/return after this
+        {
+            Log.Warning("Hook stub ({Len} bytes) may overflow PalGetModuleHandleFromPointer; not patching.", stub.Length);
+            return;
+        }
 
-        // Patch original function: 14-byte absolute indirect jmp to hook.
-        var patch = new byte[14];
-        patch[0] = 0xFF; patch[1] = 0x25; // jmp [rip+0]
-        BitConverter.GetBytes((ulong)hookAddr).CopyTo(patch, 6);
+        var oldProtect = ProtectMemory(hProcess, (nint)funcAddr, (uint)stub.Length, PAGE_EXECUTE_READWRITE);
+        WriteMemory(hProcess, (nint)funcAddr, stub);
+        ProtectMemory(hProcess, (nint)funcAddr, (uint)stub.Length, oldProtect);
+        FlushInstructionCache(hProcess, (nint)funcAddr, (nuint)stub.Length);
 
-        var oldProtect = ProtectMemory(hProcess, funcAddr, 14, PAGE_EXECUTE_READWRITE);
-        WriteMemory(hProcess, funcAddr, patch);
-        ProtectMemory(hProcess, funcAddr, 14, oldProtect);
-        FlushInstructionCache(hProcess, funcAddr, 14);
-        FlushInstructionCache(hProcess, hookAddr, (nuint)hook.Length);
+        Log.Information("Replaced PalGetModuleHandleFromPointer @0x{Func:X} with in-range hook for [0x{Start:X}, 0x{End:X})",
+            funcAddr, (ulong)remoteBase, moduleEnd);
+    }
 
-        Log.Information("Hooked PalGetModuleHandleFromPointer for range [0x{Start:X}, 0x{End:X})",
-            (ulong)remoteBase, moduleEnd);
+    /// <summary>
+    /// Search every executable section for the unique call-site signature
+    /// <c>B9 05 00 00 00 FF 15 ?? ?? ?? ??</c> — <c>mov ecx, 5; call qword ptr [rip+disp32]</c>.
+    /// Returns (fileOffset, sectionRvaDelta) where <c>fileOffset + sectionRvaDelta</c> = RVA.
+    /// Returns (-1, 0) if not found.
+    /// </summary>
+    private static (int fileOffset, int sectionRvaDelta) FindPalGetModuleHandleCallSite(byte[] dll)
+    {
+        var sections = GetSectionHeaders(dll);
+        foreach (var section in sections)
+        {
+            if ((section.Characteristics & (uint)SectionCharacteristics.IMAGE_SCN_MEM_EXECUTE) == 0)
+                continue;
+
+            int start = (int)section.PointerToRawData;
+            int end = start + (int)section.SizeOfRawData - 11;
+            int delta = (int)section.VirtualAddress - (int)section.PointerToRawData;
+
+            for (int i = start; i <= end; i++)
+            {
+                if (dll[i] == 0xB9
+                    && dll[i + 1] == 0x05 && dll[i + 2] == 0x00 && dll[i + 3] == 0x00 && dll[i + 4] == 0x00
+                    && dll[i + 5] == 0xFF && dll[i + 6] == 0x15)
+                {
+                    return (i, delta);
+                }
+            }
+        }
+        return (-1, 0);
     }
 
     private static int FindPattern(byte[] data, byte[] pattern)
@@ -895,15 +977,22 @@ public static partial class ManualMapper
 
         b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_DLLMAIN);
 
+        // Unlink from all three PEB lists, then release loader lock — BEFORE the dotnetMain call.
+        // NativeAOT's DllMain is a no-op; the runtime initializes lazily on the first UCO call,
+        // and that init creates threads (finalizer, etc.) which need the loader lock to attach.
+        // Calling dotnetMain under the loader lock is a guaranteed deadlock for NativeAOT shared
+        // libs. Moving the dispatch out of the locked region makes it safe; for native DLLs that
+        // don't need the loader released first, the swap is a no-op.
+        EmitRemoveFromPebLists(b, ldrStructures);
+        b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_PEB_UNLINK);
+        EmitLoaderLockRelease(b, loaderFns.Unlock);
+        b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_LOCK_RELEASE);
+
         if (dotnetMain != 0)
         {
             b.Mov_Reg_Imm64(0, dotnetMain).Call_Rax();
             b.WriteDebugMarker(markerAddr, DEBUG_MARKER_POST_DOTNETMAIN);
         }
-
-        // Unlink from all three PEB lists, then release loader lock
-        EmitRemoveFromPebLists(b, ldrStructures);
-        EmitLoaderLockRelease(b, loaderFns.Unlock);
 
         if (headerSize > 0)
             b.EraseMemory(moduleBase, headerSize);
@@ -1018,11 +1107,13 @@ public static partial class ManualMapper
          .Mov_Reg_Imm64(0, dllMain)
          .Call_Rax();
 
-        if (dotnetMainAddr != nint.Zero)
-            b.Mov_Reg_Imm64(0, (ulong)dotnetMainAddr).Call_Rax();
-
+        // PEB unlink + loader-lock release happen BEFORE dotnetMain — see notes on the hijack stub
+        // for why (NativeAOT's lazy runtime init can deadlock under loader lock).
         EmitRemoveFromPebLists(b, ldrStructures);
         EmitLoaderLockRelease(b, loaderFns.Unlock);
+
+        if (dotnetMainAddr != nint.Zero)
+            b.Mov_Reg_Imm64(0, (ulong)dotnetMainAddr).Call_Rax();
 
         if (nt.OptionalHeader.SizeOfHeaders > 0)
             b.EraseMemory((ulong)moduleBase, nt.OptionalHeader.SizeOfHeaders);
